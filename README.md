@@ -27,6 +27,8 @@ Each slim session stores a non-context link to the backup of its immediate paren
 `restore` without a path restores the immediate parent backup linked to the current session. Both forms show the backup details and ask for confirmation.
 
 The package uses Pi's `switchSession()` lifecycle. It does not patch Pi's core or call reload as a substitute for session switching.
+Release steps are documented in [RELEASING.md](RELEASING.md).
+
 
 ## Development
 
