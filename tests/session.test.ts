@@ -4,8 +4,10 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, test } from "vitest";
 import {
+  appendSurgeryMetadata,
   buildSlimSession,
   createBackup,
+  latestSurgeryMetadata,
   parseSession,
   restoreBackup,
   serializeSession,
@@ -48,6 +50,21 @@ function fixtureEntries(): SessionEntry[] {
     { type: "message", id: "r1", parentId: "a1", timestamp: "2026-01-01T00:00:04.000Z", message: { role: "toolResult", toolCallId: "call", toolName: "read", content: [{ type: "text", text: "remove me" }], isError: false } },
     { type: "compaction", id: "c1", parentId: "r1", timestamp: "2026-01-01T00:00:05.000Z", summary: "keep summary", firstKeptEntryId: "a1", tokensBefore: 10 },
     { type: "custom_message", id: "x1", parentId: "c1", timestamp: "2026-01-01T00:00:06.000Z", customType: "mesh", content: "remove me", display: true },
+    {
+      type: "custom",
+      id: "s1",
+      parentId: "x1",
+      timestamp: "2026-01-01T00:00:07.000Z",
+      customType: "pi-session-surgery",
+      data: {
+        version: 1,
+        operation: "slim",
+        backupManifest: "/tmp/manifest.json",
+        backupSha256: "abc123",
+        sourceSessionId: "source-session",
+        createdAt: "2026-01-01T00:00:07.000Z",
+      },
+    },
   ];
 }
 
@@ -63,10 +80,28 @@ describe("session surgery", () => {
     const assistant = parsedSlim.entries.find((entry) => entry.message?.role === "assistant");
 
     expect(assistant?.message.content.map((block: { type: string }) => block.type)).toEqual(["thinking", "text"]);
+
     expect(parsedSlim.entries.some((entry) => entry.type === "custom_message")).toBe(false);
+    expect(latestSurgeryMetadata(parsedSlim)?.backupManifest).toBe("/tmp/manifest.json");
     expect(parsedSlim.entries.some((entry) => entry.message?.role === "toolResult")).toBe(false);
     expect(parsedSlim.entries.find((entry) => entry.type === "compaction")?.firstKeptEntryId).toBe(assistant?.id);
     expect(parsedSlim.entries.every((entry, index) => entry.parentId === (index === 0 ? null : parsedSlim.entries[index - 1].id))).toBe(true);
+  });
+
+  test("appends metadata for the immediate parent backup", () => {
+    const parsed = parseSession(Buffer.from(fixtureText()), "fixture.jsonl");
+    const slim = appendSurgeryMetadata(buildSlimSession(parsed), {
+      version: 1,
+      operation: "slim",
+      backupManifest: "/tmp/new-manifest.json",
+      backupSha256: "def456",
+      sourceSessionId: "fixture-session",
+      createdAt: "2026-01-01T00:00:08.000Z",
+    });
+    const parsedSlim = parseSession(serializeSession(slim), "slim.jsonl");
+
+    expect(latestSurgeryMetadata(parsedSlim)?.backupManifest).toBe("/tmp/new-manifest.json");
+    expect(parsedSlim.entries.at(-1)?.customType).toBe("pi-session-surgery");
   });
 
   test("creates an immutable backup and restores its exact bytes", async () => {

@@ -7,9 +7,12 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import {
+  appendSurgeryMetadata,
   buildSlimSession,
   createBackup,
   defaultBackupRoot,
+  latestSurgeryMetadata,
+  readBackupManifest,
   readStableSession,
   restoreBackup,
   serializeSession,
@@ -77,8 +80,16 @@ async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
   }
 
   const parsed = await readStableSession(preview.sourcePath);
-  const slim = buildSlimSession(parsed);
+  const baseSlim = buildSlimSession(parsed);
   const backup = await createBackup(preview.sourcePath, parsed);
+  const slim = appendSurgeryMetadata(baseSlim, {
+    version: 1,
+    operation: "slim",
+    backupManifest: backup.manifestPath,
+    backupSha256: backup.sha256,
+    sourceSessionId: parsed.header.id!,
+    createdAt: backup.createdAt,
+  });
   const replacementPath = outputPath(preview.sourcePath);
   await writeReplacementSession(replacementPath, slim);
   const replacement = SessionManager.open(replacementPath);
@@ -103,9 +114,28 @@ async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
 
 async function runRestore(args: string, ctx: ExtensionCommandContext): Promise<void> {
   await ctx.waitForIdle();
-  const manifestPath = resolveUserPath(args.trim());
   const sourcePath = ctx.sessionManager.getSessionFile();
   if (!sourcePath) throw new Error("The current session is not persisted to a file");
+
+  const current = await readStableSession(sourcePath);
+  const requestedPath = args.trim();
+  const metadata = requestedPath ? undefined : latestSurgeryMetadata(current);
+  const manifestPath = requestedPath ? resolveUserPath(requestedPath) : metadata?.backupManifest;
+  if (!manifestPath) {
+    throw new Error("No session-surgery backup is linked to this session; pass a manifest path explicitly");
+  }
+
+  const manifest = await readBackupManifest(manifestPath);
+  if (!ctx.hasUI) throw new Error("Session restore needs an interactive or RPC UI for confirmation");
+  const confirmed = await ctx.ui.confirm(
+    "Restore the parent session?",
+    `Backup: ${manifestPath}\nOriginal session: ${manifest.sessionId}\nSize: ${formatBytes(manifest.byteCount)}\n\nThis creates a new session and leaves the backup untouched.`,
+  );
+  if (!confirmed) {
+    ctx.ui.notify("Session restore cancelled", "info");
+    return;
+  }
+
   const replacementPath = outputPath(sourcePath).replace(".surgery-", ".restored-");
   await restoreBackup(manifestPath, replacementPath);
   SessionManager.open(replacementPath).buildSessionContext();
@@ -124,7 +154,9 @@ export default function register(pi: ExtensionAPI): void {
     description: "Safely rewrite the current Pi session after showing a preview",
     handler: async (args, ctx) => {
       try {
-        if (args.trim().startsWith("restore ")) return await runRestore(args.trim().slice("restore ".length), ctx);
+        const commandArgs = args.trim();
+        if (commandArgs === "restore") return await runRestore("", ctx);
+        if (commandArgs.startsWith("restore ")) return await runRestore(commandArgs.slice("restore ".length), ctx);
         return await runSurgery(ctx);
       } catch (error) {
         ctx.ui.notify(`Session surgery failed: ${String(error)}`, "error");

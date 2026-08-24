@@ -40,14 +40,51 @@ export interface BackupResult {
   backupPath: string;
   manifestPath: string;
   sha256: string;
+  createdAt: string;
 }
 
+/** Metadata that links a slim session to its immediate source backup. */
+export interface SurgeryMetadata {
+  version: 1;
+  operation: "slim";
+  backupManifest: string;
+  backupSha256: string;
+  sourceSessionId: string;
+  createdAt: string;
+}
+
+/** The manifest written beside an immutable session backup. */
+export interface BackupManifest {
+  version: 1;
+  sourcePath: string;
+  backupPath: string;
+  sessionId: string;
+  createdAt: string;
+  byteCount: number;
+  sha256: string;
+}
+
+/** The custom entry type used for non-context restore links. */
+export const SURGERY_CUSTOM_TYPE = "pi-session-surgery";
 const BACKUP_ROOT = join(homedir(), ".pi", "agent", "session-backups");
 
 function fail(message: string): never {
   throw new Error(message);
 }
 
+function surgeryMetadataFrom(value: unknown): SurgeryMetadata | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const data = value as Record<string, unknown>;
+  if (
+    data.version !== 1 ||
+    data.operation !== "slim" ||
+    typeof data.backupManifest !== "string" ||
+    typeof data.backupSha256 !== "string" ||
+    typeof data.sourceSessionId !== "string" ||
+    typeof data.createdAt !== "string"
+  ) return undefined;
+  return data as unknown as SurgeryMetadata;
+}
 /** Parse and validate a Pi v3 JSONL session. */
 export function parseSession(raw: Buffer, sourcePath: string): ParsedSession {
   const text = raw.toString("utf8");
@@ -141,6 +178,10 @@ function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
     return { ...structuredClone(entry), message: { ...structuredClone(entry.message), content } };
   }
 
+  if (entry.type === "custom" && entry.customType === SURGERY_CUSTOM_TYPE && surgeryMetadataFrom(entry.data)) {
+    return structuredClone(entry);
+  }
+
   if (["model_change", "thinking_level_change", "session_info", "compaction"].includes(entry.type)) {
     return structuredClone(entry);
   }
@@ -184,6 +225,34 @@ export function buildSlimSession(session: ParsedSession): SlimSession {
     entries: retained.map(({ entry }) => entry),
     originalCount: session.entries.length,
     keptCount: retained.length,
+  };
+}
+
+/** Return the latest surgery metadata on the active branch. */
+export function latestSurgeryMetadata(session: ParsedSession): SurgeryMetadata | undefined {
+  for (const entry of [...activeBranch(session)].reverse()) {
+    if (entry.type !== "custom" || entry.customType !== SURGERY_CUSTOM_TYPE) continue;
+    const metadata = surgeryMetadataFrom(entry.data);
+    if (metadata) return metadata;
+  }
+  return undefined;
+}
+
+/** Append the link to the backup that produced a replacement session. */
+export function appendSurgeryMetadata(session: SlimSession, metadata: SurgeryMetadata): SlimSession {
+  const usedIds = new Set(session.entries.flatMap((entry) => entry.id ? [entry.id] : []));
+  const entry: SessionEntry = {
+    type: "custom",
+    id: freshId(usedIds),
+    parentId: session.entries.at(-1)?.id ?? null,
+    timestamp: metadata.createdAt,
+    customType: SURGERY_CUSTOM_TYPE,
+    data: structuredClone(metadata),
+  };
+  return {
+    ...session,
+    entries: [...session.entries, entry],
+    keptCount: session.keptCount + 1,
   };
 }
 
@@ -235,15 +304,16 @@ export async function createBackup(
   const backupPath = join(directory, "original.jsonl");
   const manifestPath = join(directory, "manifest.json");
   const digest = sha256(session.raw);
+  const createdAt = new Date().toISOString();
   await writeFile(backupPath, session.raw, { flag: "wx", mode: 0o600 });
   if (sha256(await readFile(backupPath)) !== digest) fail("backup checksum mismatch");
 
   await writeFile(
     manifestPath,
-    `${JSON.stringify({ version: 1, sourcePath, backupPath, sessionId: session.header.id, createdAt: new Date().toISOString(), byteCount: session.raw.byteLength, sha256: digest }, null, 2)}\n`,
+    `${JSON.stringify({ version: 1, sourcePath, backupPath, sessionId: session.header.id, createdAt, byteCount: session.raw.byteLength, sha256: digest }, null, 2)}\n`,
     { flag: "wx", mode: 0o600 },
   );
-  return { backupPath, manifestPath, sha256: digest };
+  return { backupPath, manifestPath, sha256: digest, createdAt };
 }
 
 /** Write a validated replacement session without touching the source. */
@@ -254,12 +324,24 @@ export async function writeReplacementSession(path: string, session: SlimSession
   return raw;
 }
 
+/** Read and validate a backup manifest without changing any files. */
+export async function readBackupManifest(manifestPath: string): Promise<BackupManifest> {
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+  if (
+    manifest.version !== 1 ||
+    typeof manifest.sourcePath !== "string" ||
+    typeof manifest.backupPath !== "string" ||
+    typeof manifest.sessionId !== "string" ||
+    typeof manifest.createdAt !== "string" ||
+    typeof manifest.byteCount !== "number" ||
+    typeof manifest.sha256 !== "string"
+  ) fail(`${manifestPath}: invalid backup manifest`);
+  return manifest as unknown as BackupManifest;
+}
+
 /** Restore a backup to a new or existing target without changing the backup. */
 export async function restoreBackup(manifestPath: string, targetPath: string): Promise<void> {
-  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, any>;
-  if (manifest.version !== 1 || typeof manifest.backupPath !== "string" || typeof manifest.sha256 !== "string") {
-    fail(`${manifestPath}: invalid backup manifest`);
-  }
+  const manifest = await readBackupManifest(manifestPath);
   const backup = await readFile(manifest.backupPath);
   if (sha256(backup) !== manifest.sha256) fail(`${manifest.backupPath}: checksum mismatch`);
   await writeAtomic(resolve(targetPath), backup, false);
