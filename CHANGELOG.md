@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 — 2026-08-24
+
+- Add automated CI, secret scanning, and provenance-backed npm publishing.
+- Document the public release and Trusted Publishing setup.
+
 ## 0.1.0 — 2026-08-24
 
 - Add `/session-surgery` to rebuild a Pi session without persisted tool history.
