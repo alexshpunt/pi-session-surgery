@@ -6,6 +6,8 @@
   "files": [
     "src",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "keywords": [
@@ -28,7 +30,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
-    "prepack": "npm run check"
+    "prepack": "npm run check",
+    "audit": "npm audit --omit=dev --audit-level=high"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -40,5 +43,16 @@
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0",
     "vitest": "^4.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexshpunt/pi-session-surgery.git"
+  },
+  "bugs": {
+    "url": "https://github.com/alexshpunt/pi-session-surgery/issues"
+  },
+  "homepage": "https://github.com/alexshpunt/pi-session-surgery#readme",
+  "publishConfig": {
+    "access": "public"
   }
 }
