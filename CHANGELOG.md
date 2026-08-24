@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 — 2026-08-24
+
+- Fix atomic session writes on Windows paths.
+- Run the package test suite on Windows in CI.
+
 ## 0.1.1 — 2026-08-24
 
 - Add automated CI, secret scanning, and provenance-backed npm publishing.

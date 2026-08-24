@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 /** A JSON object stored as one Pi session entry. */
 export type SessionEntry = Record<string, any> & {
@@ -279,7 +279,7 @@ async function writeAtomic(path: string, raw: Buffer, refuseExisting: boolean): 
     }
   }
 
-  const temporary = join(dirname(path), `.${path.split("/").pop()}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
+  const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
   const handle = await open(temporary, "wx", 0o600);
   try {
     await handle.writeFile(raw);
