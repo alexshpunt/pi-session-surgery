@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 — 2026-08-24
+
+- Keep the Windows CI check portable across Windows file-mode reporting.
+
 ## 0.1.2 — 2026-08-24
 
 - Fix atomic session writes on Windows paths.

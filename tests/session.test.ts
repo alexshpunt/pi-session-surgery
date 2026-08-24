@@ -118,6 +118,8 @@ describe("session surgery", () => {
 
     expect(await readFile(backup.backupPath)).toEqual(source);
     expect(await readFile(targetPath)).toEqual(source);
-    expect((await stat(backup.backupPath)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await stat(backup.backupPath)).mode & 0o777).toBe(0o600);
+    }
   });
 });
