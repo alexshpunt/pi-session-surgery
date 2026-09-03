@@ -3,7 +3,7 @@ import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { loadSessionSurgeryConfig } from "./config.js";
@@ -208,31 +208,34 @@ export default function register(pi: ExtensionAPI): void {
     }
   });
 
-  const scheduleAutomaticCheckpoint = (): void => {
-    if (dispatchTimer || !pendingCompactionId) return;
+  const scheduleAutomaticCheckpoint = (ctx: ExtensionContext): void => {
+    if (dispatchTimer || !pendingCompactionId || ctx.hasPendingMessages()) return;
     dispatchTimer = setTimeout(() => {
       dispatchTimer = undefined;
+      if (ctx.hasPendingMessages()) return;
       const compactionId = pendingCompactionId;
-      pendingCompactionId = undefined;
       if (!compactionId) return;
-      pi.sendUserMessage(`/${AUTO_COMMAND} ${compactionId}`, { expandPromptTemplates: true });
+      pi.sendUserMessage(`/${AUTO_COMMAND} ${compactionId}`, {
+        deliverAs: "followUp",
+        expandPromptTemplates: true,
+      });
+      pendingCompactionId = undefined;
     }, 0);
   };
 
   pi.on("session_compact", (event, ctx) => {
     if (!autoAfterCompaction) return;
     pendingCompactionId = event.compactionEntry.id;
-    if (ctx.isIdle()) scheduleAutomaticCheckpoint();
+    if (ctx.isIdle()) scheduleAutomaticCheckpoint(ctx);
   });
 
-  pi.on("agent_settled", () => {
-    scheduleAutomaticCheckpoint();
+  pi.on("agent_settled", (_event, ctx) => {
+    scheduleAutomaticCheckpoint(ctx);
   });
 
   pi.on("session_shutdown", () => {
     if (dispatchTimer) clearTimeout(dispatchTimer);
     dispatchTimer = undefined;
-    pendingCompactionId = undefined;
   });
 
   pi.registerCommand(COMMAND, {
