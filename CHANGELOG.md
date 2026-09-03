@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Trim the persisted session automatically after successful compaction while keeping Pi's post-compaction context unchanged.
+- Add the `autoAfterCompaction` setting, enabled by default, with global and trusted-project overrides.
 - Rebuild retained assistant messages as plain transcript content so stale provider replay metadata cannot break tool use in the replacement session.
 
 ## 0.1.3 — 2026-08-24

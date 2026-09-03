@@ -4,10 +4,14 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
+
+import { loadSessionSurgeryConfig } from "./config.js";
 
 import {
+  activeBranch,
   appendSurgeryMetadata,
+  buildCompactionCheckpoint,
   buildSlimSession,
   createBackup,
   defaultBackupRoot,
@@ -20,6 +24,8 @@ import {
 } from "./session.js";
 
 const COMMAND = "session-surgery";
+
+const AUTO_COMMAND = "session-surgery-auto";
 
 function resolveUserPath(value: string): string {
   return value === "~" || value.startsWith("~/")
@@ -112,6 +118,45 @@ async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
   }
 }
 
+async function runAutomaticCheckpoint(compactionId: string, ctx: ExtensionCommandContext): Promise<void> {
+  await ctx.waitForIdle();
+  const sourcePath = ctx.sessionManager.getSessionFile();
+  if (!sourcePath) throw new Error("The current session is not persisted to a file");
+
+  const parsed = await readStableSession(sourcePath);
+  const branch = activeBranch(parsed);
+  if (!branch.some((entry) => entry.type === "compaction" && entry.id === compactionId)) return;
+
+  const baseCheckpoint = buildCompactionCheckpoint(parsed);
+  const backup = await createBackup(sourcePath, parsed);
+  const checkpoint = appendSurgeryMetadata(baseCheckpoint, {
+    version: 1,
+    operation: "slim",
+    backupManifest: backup.manifestPath,
+    backupSha256: backup.sha256,
+    sourceSessionId: parsed.header.id!,
+    createdAt: backup.createdAt,
+  });
+  const replacementPath = outputPath(sourcePath);
+  await writeReplacementSession(replacementPath, checkpoint);
+  SessionManager.open(replacementPath).buildSessionContext();
+
+  const switched = await ctx.switchSession(replacementPath, {
+    withSession: async (nextCtx) => {
+      try {
+        await unlink(sourcePath);
+      } catch (error) {
+        nextCtx.ui.notify(`Compacted session opened, but old file was not removed: ${String(error)}`, "warning");
+        return;
+      }
+      nextCtx.ui.notify(`Compacted session trimmed. Backup: ${backup.manifestPath}`, "info");
+    },
+  });
+  if (switched.cancelled) {
+    ctx.ui.notify(`Automatic session switch cancelled. Replacement kept at ${replacementPath}`, "warning");
+  }
+}
+
 async function runRestore(args: string, ctx: ExtensionCommandContext): Promise<void> {
   await ctx.waitForIdle();
   const sourcePath = ctx.sessionManager.getSessionFile();
@@ -148,8 +193,48 @@ async function runRestore(args: string, ctx: ExtensionCommandContext): Promise<v
   if (switched.cancelled) ctx.ui.notify(`Restore session kept at ${replacementPath}`, "warning");
 }
 
-/** Register the destructive session rewrite and restore commands. */
+/** Register manual surgery, restore, and automatic post-compaction checkpointing. */
 export default function register(pi: ExtensionAPI): void {
+  let autoAfterCompaction = true;
+  let pendingCompactionId: string | undefined;
+  let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
+
+  pi.on("session_start", (_event, ctx) => {
+    try {
+      autoAfterCompaction = loadSessionSurgeryConfig(ctx.cwd, getAgentDir(), ctx.isProjectTrusted()).autoAfterCompaction;
+    } catch (error) {
+      autoAfterCompaction = false;
+      ctx.ui.notify(`Automatic session surgery disabled: ${String(error)}`, "error");
+    }
+  });
+
+  const scheduleAutomaticCheckpoint = (): void => {
+    if (dispatchTimer || !pendingCompactionId) return;
+    dispatchTimer = setTimeout(() => {
+      dispatchTimer = undefined;
+      const compactionId = pendingCompactionId;
+      pendingCompactionId = undefined;
+      if (!compactionId) return;
+      pi.sendUserMessage(`/${AUTO_COMMAND} ${compactionId}`, { expandPromptTemplates: true });
+    }, 0);
+  };
+
+  pi.on("session_compact", (event, ctx) => {
+    if (!autoAfterCompaction) return;
+    pendingCompactionId = event.compactionEntry.id;
+    if (ctx.isIdle()) scheduleAutomaticCheckpoint();
+  });
+
+  pi.on("agent_settled", () => {
+    scheduleAutomaticCheckpoint();
+  });
+
+  pi.on("session_shutdown", () => {
+    if (dispatchTimer) clearTimeout(dispatchTimer);
+    dispatchTimer = undefined;
+    pendingCompactionId = undefined;
+  });
+
   pi.registerCommand(COMMAND, {
     description: "Safely rewrite the current Pi session after showing a preview",
     handler: async (args, ctx) => {
@@ -160,6 +245,19 @@ export default function register(pi: ExtensionAPI): void {
         return await runSurgery(ctx);
       } catch (error) {
         ctx.ui.notify(`Session surgery failed: ${String(error)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand(AUTO_COMMAND, {
+    description: "Internal command that trims a successfully compacted session",
+    handler: async (args, ctx) => {
+      try {
+        const compactionId = args.trim();
+        if (!compactionId) throw new Error("missing compaction id");
+        await runAutomaticCheckpoint(compactionId, ctx);
+      } catch (error) {
+        ctx.ui.notify(`Automatic session surgery failed: ${String(error)}`, "error");
       }
     },
   });

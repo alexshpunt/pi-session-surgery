@@ -213,6 +213,89 @@ function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
   return undefined;
 }
 
+/** Build a small replacement whose active context matches the latest compaction checkpoint. */
+export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
+  const branch = activeBranch(session);
+  let compactionIndex = -1;
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    if (branch[index].type === "compaction") {
+      compactionIndex = index;
+      break;
+    }
+  }
+  if (compactionIndex < 0) fail("session has no compaction checkpoint");
+
+  const compaction = branch[compactionIndex];
+  const hasMaterializedTail = Array.isArray(compaction.retainedTail);
+  const firstKeptIndex = hasMaterializedTail
+    ? compactionIndex
+    : branch.findIndex((entry, index) => index < compactionIndex && entry.id === compaction.firstKeptEntryId);
+  if (firstKeptIndex < 0) {
+    fail(`compaction ${compaction.id} first kept entry ${String(compaction.firstKeptEntryId)} was not found`);
+  }
+
+  const prefix = branch.slice(0, firstKeptIndex);
+  const controls = new Map<string, { index: number; entry: SessionEntry }>();
+  for (const [index, entry] of prefix.entries()) {
+    if (entry.type === "model_change") {
+      controls.set("model", { index, entry: structuredClone(entry) });
+    } else if (
+      entry.type === "message" &&
+      entry.message?.role === "assistant" &&
+      typeof entry.message.provider === "string" &&
+      typeof entry.message.model === "string"
+    ) {
+      controls.set("model", {
+        index,
+        entry: {
+          type: "model_change",
+          id: entry.id,
+          parentId: entry.parentId,
+          timestamp: entry.timestamp,
+          provider: entry.message.provider,
+          modelId: entry.message.model,
+        },
+      });
+    } else if (entry.type === "thinking_level_change") {
+      controls.set("thinking", { index, entry: structuredClone(entry) });
+    } else if (entry.type === "session_info") {
+      controls.set("session-info", { index, entry: structuredClone(entry) });
+    }
+  }
+
+  const selected = [
+    ...[...controls.values()].sort((left, right) => left.index - right.index).map(({ entry }) => entry),
+    ...branch.slice(firstKeptIndex).map((entry) => structuredClone(entry)),
+  ];
+  const usedIds = new Set<string>();
+  const mappedIds = new Map<string, string>();
+  for (const entry of selected) {
+    const originalId = entry.id!;
+    entry.id = freshId(usedIds);
+    entry.parentId = null;
+    mappedIds.set(originalId, entry.id);
+  }
+  for (const [index, entry] of selected.entries()) {
+    entry.parentId = index === 0 ? null : selected[index - 1].id;
+    if (entry.type !== "compaction" || typeof entry.firstKeptEntryId !== "string") continue;
+    const mappedFirstKept = mappedIds.get(entry.firstKeptEntryId);
+    if (mappedFirstKept) entry.firstKeptEntryId = mappedFirstKept;
+  }
+
+  const rebuiltCompaction = selected.find((entry) => entry.id === mappedIds.get(compaction.id!));
+  if (!hasMaterializedTail && !mappedIds.has(compaction.firstKeptEntryId)) {
+    fail(`compaction ${compaction.id} first kept entry could not be retained`);
+  }
+  if (!rebuiltCompaction) fail(`compaction ${compaction.id} could not be retained`);
+
+  return {
+    header: structuredClone(session.header),
+    entries: selected,
+    originalCount: session.entries.length,
+    keptCount: selected.length,
+  };
+}
+
 /** Build a new linear session while preserving conversation and compaction state. */
 export function buildSlimSession(session: ParsedSession): SlimSession {
   const branch = activeBranch(session);

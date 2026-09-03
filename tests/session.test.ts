@@ -2,9 +2,11 @@ import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test } from "vitest";
 import {
   appendSurgeryMetadata,
+  buildCompactionCheckpoint,
   buildSlimSession,
   createBackup,
   latestSurgeryMetadata,
@@ -132,6 +134,85 @@ describe("session surgery", () => {
         stopReason: "stop",
       },
     ]);
+  });
+
+  test("restarts from the latest compacted checkpoint without changing its context", async () => {
+    const entries = fixtureEntries();
+    entries.splice(1, 0, {
+      type: "thinking_level_change",
+      id: "t1",
+      parentId: "m1",
+      timestamp: "2026-01-01T00:00:01.500Z",
+      thinkingLevel: "high",
+    });
+    entries[3].parentId = "t1";
+
+    const originalRaw = Buffer.from(`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+    const parsed = parseSession(originalRaw, "fixture.jsonl");
+    const checkpoint = buildCompactionCheckpoint(parsed);
+    const checkpointRaw = serializeSession(checkpoint);
+    const parsedCheckpoint = parseSession(checkpointRaw, "checkpoint.jsonl");
+    const context = parsedCheckpoint.entries;
+
+    expect(context.some((entry) => entry.id === "u1" || entry.message?.content === "hello")).toBe(false);
+    expect(context.find((entry) => entry.type === "model_change")).toMatchObject({ provider: "openai-codex", modelId: "gpt-test" });
+    expect(context.find((entry) => entry.type === "thinking_level_change")).toMatchObject({ thinkingLevel: "high" });
+    expect(context.find((entry) => entry.type === "compaction")?.summary).toBe("keep summary");
+    expect(context.find((entry) => entry.type === "compaction")?.firstKeptEntryId).toBe(
+      context.find((entry) => entry.message?.role === "assistant")?.id,
+    );
+    expect(context.find((entry) => entry.message?.role === "assistant")?.message.content).toContainEqual({
+      type: "toolCall",
+      id: "call",
+      name: "read",
+      arguments: {},
+    });
+    expect(context.find((entry) => entry.message?.role === "toolResult")?.message.content).toEqual([
+      { type: "text", text: "remove me" },
+    ]);
+    expect(context.some((entry) => entry.type === "custom_message")).toBe(true);
+    expect(context.every((entry, index) => entry.parentId === (index === 0 ? null : context[index - 1].id))).toBe(true);
+
+    const directory = await mkdtemp(join(tmpdir(), "pi-session-surgery-context-"));
+    temporaryDirectories.push(directory);
+    const originalPath = join(directory, "original.jsonl");
+    const checkpointPath = join(directory, "checkpoint.jsonl");
+    await writeFile(originalPath, originalRaw);
+    await writeFile(checkpointPath, checkpointRaw);
+    expect(SessionManager.open(checkpointPath).buildSessionContext()).toEqual(
+      SessionManager.open(originalPath).buildSessionContext(),
+    );
+  });
+
+  test("keeps a materialized compacted tail as a self-contained checkpoint", () => {
+    const entries = fixtureEntries();
+    const compaction = entries.find((entry) => entry.type === "compaction")!;
+    delete compaction.firstKeptEntryId;
+    compaction.retainedTail = [
+      { role: "user", content: "recent request", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "recent-call", name: "read", arguments: { path: "README.md" } }],
+        stopReason: "toolUse",
+      },
+      { role: "toolResult", toolCallId: "recent-call", toolName: "read", content: [], isError: false },
+    ];
+
+    const parsed = parseSession(Buffer.from(`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`), "fixture.jsonl");
+    const checkpoint = buildCompactionCheckpoint(parsed);
+    const rebuiltCompaction = checkpoint.entries.find((entry) => entry.type === "compaction");
+
+    expect(checkpoint.entries.some((entry) => entry.message?.content === "hello")).toBe(false);
+    expect(rebuiltCompaction?.retainedTail).toEqual(compaction.retainedTail);
+  });
+
+  test("refuses checkpoint trimming when the compacted tail cannot be recovered", () => {
+    const entries = fixtureEntries();
+    const compaction = entries.find((entry) => entry.type === "compaction")!;
+    compaction.firstKeptEntryId = "missing";
+    const parsed = parseSession(Buffer.from(`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`), "fixture.jsonl");
+
+    expect(() => buildCompactionCheckpoint(parsed)).toThrow(/first kept entry/i);
   });
 
   test("appends metadata for the immediate parent backup", () => {

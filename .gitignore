@@ -1,6 +1,7 @@
 node_modules/
 .mesh/
 .tmp/
+.agents/tmp/
 dist/
 coverage/
 .env
