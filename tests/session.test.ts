@@ -40,11 +40,13 @@ function fixtureEntries(): SessionEntry[] {
       message: {
         role: "assistant",
         content: [
-          { type: "thinking", thinking: "keep me", thinkingSignature: "sig" },
+          { type: "thinking", thinking: "keep me", thinkingSignature: "sig", redacted: true },
           { type: "toolCall", id: "call", name: "read", arguments: {} },
-          { type: "text", text: "keep this" },
+          { type: "text", text: "keep this", textSignature: "text-sig" },
         ],
         stopReason: "toolUse",
+        rawStopReason: "tool_calls",
+        responseId: "response-1",
       },
     },
     { type: "message", id: "r1", parentId: "a1", timestamp: "2026-01-01T00:00:04.000Z", message: { role: "toolResult", toolCallId: "call", toolName: "read", content: [{ type: "text", text: "remove me" }], isError: false } },
@@ -81,11 +83,55 @@ describe("session surgery", () => {
 
     expect(assistant?.message.content.map((block: { type: string }) => block.type)).toEqual(["thinking", "text"]);
 
+    expect(assistant?.message).toMatchObject({ stopReason: "stop" });
+    expect(assistant?.message).not.toHaveProperty("rawStopReason");
+    expect(assistant?.message).not.toHaveProperty("responseId");
+
+    expect(Object.keys(assistant?.message ?? {}).sort()).toEqual(["content", "role", "stopReason"]);
+    expect(assistant?.message.content[0]).toEqual({ type: "thinking", thinking: "keep me" });
+    expect(assistant?.message.content[1]).toEqual({ type: "text", text: "keep this" });
+
     expect(parsedSlim.entries.some((entry) => entry.type === "custom_message")).toBe(false);
     expect(latestSurgeryMetadata(parsedSlim)?.backupManifest).toBe("/tmp/manifest.json");
     expect(parsedSlim.entries.some((entry) => entry.message?.role === "toolResult")).toBe(false);
     expect(parsedSlim.entries.find((entry) => entry.type === "compaction")?.firstKeptEntryId).toBe(assistant?.id);
     expect(parsedSlim.entries.every((entry, index) => entry.parentId === (index === 0 ? null : parsedSlim.entries[index - 1].id))).toBe(true);
+  });
+
+  test("removes tool history and provider replay metadata from materialized compaction tails", () => {
+    const entries = fixtureEntries();
+    const compaction = entries.find((entry) => entry.type === "compaction")!;
+    delete compaction.firstKeptEntryId;
+    compaction.retainedTail = [
+      { role: "user", content: "keep user", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "keep thought", thinkingSignature: "sig" },
+          { type: "toolCall", id: "tail-call", name: "bash", arguments: { command: "true" } },
+          { type: "text", text: "keep answer", textSignature: "text-sig" },
+        ],
+        stopReason: "toolUse",
+        responseId: "tail-response",
+      },
+      { role: "toolResult", toolCallId: "tail-call", toolName: "bash", content: [], isError: false },
+    ];
+
+    const parsed = parseSession(Buffer.from(`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`), "fixture.jsonl");
+    const slim = buildSlimSession(parsed);
+    const tail = slim.entries.find((entry) => entry.type === "compaction")?.retainedTail;
+
+    expect(tail).toEqual([
+      { role: "user", content: "keep user", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "keep thought" },
+          { type: "text", text: "keep answer" },
+        ],
+        stopReason: "stop",
+      },
+    ]);
   });
 
   test("appends metadata for the immediate parent backup", () => {

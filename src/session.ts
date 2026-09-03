@@ -167,24 +167,49 @@ function freshId(used: Set<string>): string {
   return id;
 }
 
+function retainedMessage(message: Record<string, any>): Record<string, any> | undefined {
+  if (message?.role === "user") return structuredClone(message);
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined;
+
+  const content = message.content.flatMap((block: Record<string, any>): Array<Record<string, any>> => {
+    if (block.type === "text") return [{ type: "text", text: block.text }];
+    if (block.type === "thinking") return [{ type: "thinking", thinking: block.thinking }];
+    return [];
+  });
+  if (content.length === 0) return undefined;
+
+  const retained: Record<string, any> = { role: "assistant", content, stopReason: "stop" };
+  for (const key of ["api", "provider", "model", "usage", "timestamp"]) {
+    if (message[key] !== undefined) retained[key] = structuredClone(message[key]);
+  }
+  return retained;
+}
+
 function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
   if (entry.type === "message") {
-    if (entry.message?.role === "user") return structuredClone(entry);
-    if (entry.message?.role !== "assistant" || !Array.isArray(entry.message.content)) return undefined;
-    const content = entry.message.content.filter((block: SessionEntry) =>
-      block.type === "text" || block.type === "thinking",
-    );
-    if (content.length === 0) return undefined;
-    return { ...structuredClone(entry), message: { ...structuredClone(entry.message), content } };
+    const message = retainedMessage(entry.message);
+    return message ? { ...structuredClone(entry), message } : undefined;
   }
 
   if (entry.type === "custom" && entry.customType === SURGERY_CUSTOM_TYPE && surgeryMetadataFrom(entry.data)) {
     return structuredClone(entry);
   }
 
-  if (["model_change", "thinking_level_change", "session_info", "compaction"].includes(entry.type)) {
+  if (["model_change", "thinking_level_change", "session_info"].includes(entry.type)) {
     return structuredClone(entry);
   }
+
+  if (entry.type === "compaction") {
+    const compaction = structuredClone(entry);
+    if (Array.isArray(compaction.retainedTail)) {
+      compaction.retainedTail = compaction.retainedTail.flatMap((message: Record<string, any>) => {
+        const retained = retainedMessage(message);
+        return retained ? [retained] : [];
+      });
+    }
+    return compaction;
+  }
+
   return undefined;
 }
 

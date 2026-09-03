@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Rebuild retained assistant messages as plain transcript content so stale provider replay metadata cannot break tool use in the replacement session.
+
 ## 0.1.3 — 2026-08-24
 
 - Keep the Windows CI check portable across Windows file-mode reporting.

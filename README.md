@@ -12,7 +12,9 @@ This is not context pruning. It rewrites the session JSONL file into a smaller r
 - The backup is never overwritten by restore.
 - The old visible session file is removed only after the switch succeeds.
 
-The replacement keeps user messages, assistant text and thinking, model and thinking-level changes, session info, compaction records, and its surgery metadata. It removes tool calls, tool results, bash execution records, and other extension entries.
+The replacement keeps user messages, assistant text and thinking, model and thinking-level changes, session info, compaction records, and its surgery metadata. Retained assistant content is rebuilt as plain transcript content: provider replay IDs and signatures are discarded, and each retained assistant message gets a normal completed stop reason. This prevents removed tool exchanges from leaving invalid provider state behind.
+
+It removes tool calls, tool results, bash execution records, and other extension entries.
 
 Each slim session stores a non-context link to the backup of its immediate parent. This lets restore find the right manifest without a path.
 
