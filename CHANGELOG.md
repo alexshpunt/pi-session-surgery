@@ -6,6 +6,7 @@
 - Add the `autoAfterCompaction` setting, enabled by default, with global and trusted-project overrides.
 - Wait for queued Pi messages before trimming so Worktrunk moves are not interrupted by a session replacement.
 - Rebuild retained assistant messages as plain transcript content so stale provider replay metadata cannot break tool use in the replacement session.
+- Replace the previous rewrite suffix in session file names so repeated automatic surgery cannot hit the file name length limit.
 
 ## 0.1.3 — 2026-08-24
 

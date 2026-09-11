@@ -1,7 +1,6 @@
-import { randomBytes } from "node:crypto";
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -18,6 +17,7 @@ import {
   latestSurgeryMetadata,
   readBackupManifest,
   readStableSession,
+  replacementSessionPath,
   restoreBackup,
   serializeSession,
   writeReplacementSession,
@@ -37,12 +37,6 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
-function outputPath(sourcePath: string): string {
-  const name = basename(sourcePath, ".jsonl");
-  const stamp = new Date().toISOString().replaceAll(":", "-").replace(".", "-");
-  return join(dirname(sourcePath), `${name}.surgery-${stamp}-${randomBytes(3).toString("hex")}.jsonl`);
 }
 
 function previewText(sourceBytes: number, slimBytes: number, kept: number, removed: number): string {
@@ -96,7 +90,7 @@ async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
     sourceSessionId: parsed.header.id!,
     createdAt: backup.createdAt,
   });
-  const replacementPath = outputPath(preview.sourcePath);
+  const replacementPath = replacementSessionPath(preview.sourcePath, "surgery");
   await writeReplacementSession(replacementPath, slim);
   const replacement = SessionManager.open(replacementPath);
   replacement.buildSessionContext();
@@ -137,7 +131,7 @@ async function runAutomaticCheckpoint(compactionId: string, ctx: ExtensionComman
     sourceSessionId: parsed.header.id!,
     createdAt: backup.createdAt,
   });
-  const replacementPath = outputPath(sourcePath);
+  const replacementPath = replacementSessionPath(sourcePath, "surgery");
   await writeReplacementSession(replacementPath, checkpoint);
   SessionManager.open(replacementPath).buildSessionContext();
 
@@ -181,7 +175,7 @@ async function runRestore(args: string, ctx: ExtensionCommandContext): Promise<v
     return;
   }
 
-  const replacementPath = outputPath(sourcePath).replace(".surgery-", ".restored-");
+  const replacementPath = replacementSessionPath(sourcePath, "restored");
   await restoreBackup(manifestPath, replacementPath);
   SessionManager.open(replacementPath).buildSessionContext();
 

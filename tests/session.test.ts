@@ -1,6 +1,6 @@
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test } from "vitest";
@@ -11,6 +11,7 @@ import {
   createBackup,
   latestSurgeryMetadata,
   parseSession,
+  replacementSessionPath,
   restoreBackup,
   serializeSession,
   type SessionEntry,
@@ -248,5 +249,26 @@ describe("session surgery", () => {
     if (process.platform !== "win32") {
       expect((await stat(backup.backupPath)).mode & 0o777).toBe(0o600);
     }
+  });
+
+  test("replaces the previous rewrite suffix instead of stacking it", () => {
+    const original = join("/sessions", "2026-09-09T07-06-23-904Z_01a084fd-3d20-71ae-a6a2-b29ea76c3679.jsonl");
+    let path = replacementSessionPath(original, "surgery");
+    for (let round = 0; round < 50; round += 1) path = replacementSessionPath(path, "surgery");
+
+    const name = basename(path);
+    expect(name.split("surgery-")).toHaveLength(2);
+    expect(name.startsWith("2026-09-09T07-06-23-904Z_01a084fd-3d20-71ae-a6a2-b29ea76c3679.surgery-")).toBe(true);
+    expect(Buffer.byteLength(name)).toBeLessThan(255);
+    expect(basename(replacementSessionPath(path, "restored"))).toContain(".restored-");
+    expect(basename(replacementSessionPath(path, "restored"))).not.toContain("surgery-");
+  });
+
+  test("keeps overlong session names within the file name limit", () => {
+    const original = join("/sessions", `${"a".repeat(300)}.jsonl`);
+    const name = basename(replacementSessionPath(original, "surgery"));
+
+    expect(Buffer.byteLength(name)).toBeLessThanOrEqual(180);
+    expect(name.endsWith(".jsonl")).toBe(true);
   });
 });

@@ -424,6 +424,23 @@ export async function createBackup(
   return { backupPath, manifestPath, sha256: digest, createdAt };
 }
 
+const REWRITE_SUFFIX = /(?:\.(?:surgery|restored)-[^.]+)+$/u;
+const MAX_BASE_BYTES = 120;
+
+function sessionBaseName(sourcePath: string): string {
+  const name = basename(sourcePath, ".jsonl").replace(REWRITE_SUFFIX, "");
+  if (Buffer.byteLength(name) <= MAX_BASE_BYTES) return name;
+  // Keep the tail: the session id is the unique, identifying part.
+  return Buffer.from(name, "utf8").subarray(-MAX_BASE_BYTES).toString("utf8").replace(/^\uFFFD+/u, "");
+}
+
+/** Build the rewritten session path beside its source, replacing any earlier rewrite suffix. */
+export function replacementSessionPath(sourcePath: string, kind: "surgery" | "restored"): string {
+  const stamp = new Date().toISOString().replaceAll(":", "-").replace(".", "-");
+  const suffix = `${kind}-${stamp}-${randomBytes(3).toString("hex")}.jsonl`;
+  return join(dirname(sourcePath), `${sessionBaseName(sourcePath)}.${suffix}`);
+}
+
 /** Write a validated replacement session without touching the source. */
 export async function writeReplacementSession(path: string, session: SlimSession): Promise<Buffer> {
   const raw = serializeSession(session);
