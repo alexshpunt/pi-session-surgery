@@ -1,14 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
-import {
-  chmod,
-  mkdir,
-  open,
-  readFile,
-  rename,
-  stat,
-  writeFile,
-} from "node:fs/promises";
-import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
+import { chmod, mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
 /** A JSON object stored as one Pi session entry. */
@@ -35,56 +26,10 @@ export interface SlimSession {
   keptCount: number;
 }
 
-/** The immutable copy and manifest created before a rewrite. */
-export interface BackupResult {
-  backupPath: string;
-  manifestPath: string;
-  sha256: string;
-  createdAt: string;
-}
-
-/** Metadata that links a slim session to its immediate source backup. */
-export interface SurgeryMetadata {
-  version: 1;
-  operation: "slim";
-  backupManifest: string;
-  backupSha256: string;
-  sourceSessionId: string;
-  createdAt: string;
-}
-
-/** The manifest written beside an immutable session backup. */
-export interface BackupManifest {
-  version: 1;
-  sourcePath: string;
-  backupPath: string;
-  sessionId: string;
-  createdAt: string;
-  byteCount: number;
-  sha256: string;
-}
-
-/** The custom entry type used for non-context restore links. */
-export const SURGERY_CUSTOM_TYPE = "pi-session-surgery";
-const BACKUP_ROOT = join(homedir(), ".pi", "agent", "session-backups");
-
 function fail(message: string): never {
   throw new Error(message);
 }
 
-function surgeryMetadataFrom(value: unknown): SurgeryMetadata | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const data = value as Record<string, unknown>;
-  if (
-    data.version !== 1 ||
-    data.operation !== "slim" ||
-    typeof data.backupManifest !== "string" ||
-    typeof data.backupSha256 !== "string" ||
-    typeof data.sourceSessionId !== "string" ||
-    typeof data.createdAt !== "string"
-  ) return undefined;
-  return data as unknown as SurgeryMetadata;
-}
 /** Parse and validate a Pi v3 JSONL session. */
 export function parseSession(raw: Buffer, sourcePath: string): ParsedSession {
   const text = raw.toString("utf8");
@@ -185,14 +130,18 @@ function retainedMessage(message: Record<string, any>): Record<string, any> | un
   return retained;
 }
 
+/** Rebuild messages as plain transcript content. */
+function retainedMessages(messages: Record<string, any>[]): Record<string, any>[] {
+  return messages.flatMap((message) => {
+    const retained = retainedMessage(message);
+    return retained ? [retained] : [];
+  });
+}
+
 function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
   if (entry.type === "message") {
     const message = retainedMessage(entry.message);
     return message ? { ...structuredClone(entry), message } : undefined;
-  }
-
-  if (entry.type === "custom" && entry.customType === SURGERY_CUSTOM_TYPE && surgeryMetadataFrom(entry.data)) {
-    return structuredClone(entry);
   }
 
   if (["model_change", "thinking_level_change", "session_info"].includes(entry.type)) {
@@ -202,10 +151,7 @@ function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
   if (entry.type === "compaction") {
     const compaction = structuredClone(entry);
     if (Array.isArray(compaction.retainedTail)) {
-      compaction.retainedTail = compaction.retainedTail.flatMap((message: Record<string, any>) => {
-        const retained = retainedMessage(message);
-        return retained ? [retained] : [];
-      });
+      compaction.retainedTail = retainedMessages(compaction.retainedTail);
     }
     return compaction;
   }
@@ -213,7 +159,56 @@ function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
   return undefined;
 }
 
-/** Build a small replacement whose active context matches the latest compaction checkpoint. */
+/** One entry kept for the replacement session, with its position on the original branch. */
+interface RetainedEntry {
+  originalId: string;
+  entry: SessionEntry;
+  index: number;
+}
+
+/** Id of the newest compaction record on the branch. */
+function lastCompactionId(branch: SessionEntry[]): string | undefined {
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    if (branch[index].type === "compaction") return branch[index].id!;
+  }
+  return undefined;
+}
+
+/** Relink kept entries into one linear chain and remap compaction boundaries. */
+function relinkEntries(header: SessionEntry, retained: RetainedEntry[], originalCount: number): SlimSession {
+  const mappedIds = new Map(retained.map(({ originalId, entry }) => [originalId, entry.id!]));
+
+  for (const [position, current] of retained.entries()) {
+    current.entry.parentId = position === 0 ? null : retained[position - 1].entry.id;
+    if (current.entry.type !== "compaction" || !current.entry.firstKeptEntryId) continue;
+
+    const mapped = mappedIds.get(current.entry.firstKeptEntryId);
+    if (mapped) {
+      current.entry.firstKeptEntryId = mapped;
+      continue;
+    }
+
+    const next = retained.slice(position + 1).find((candidate) => candidate.index > current.index);
+    if (!next) fail(`compaction ${current.originalId} points to no retained entry`);
+    current.entry.firstKeptEntryId = next.entry.id;
+  }
+
+  return {
+    header: structuredClone(header),
+    entries: retained.map(({ entry }) => entry),
+    originalCount,
+    keptCount: retained.length,
+  };
+}
+
+/**
+ * Build the automatic replacement: keep everything the model can see, drop the rest.
+ *
+ * Pi rebuilds its context from the newest compaction: the summary plus every entry from that
+ * compaction's first kept entry onwards. Nothing before that boundary is sent to the model, so
+ * it is dropped here together with every older compaction record. The visible part is copied
+ * as it is, so the context Pi sends to the model does not change.
+ */
 export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
   const branch = activeBranch(session);
   let compactionIndex = -1;
@@ -234,9 +229,8 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     fail(`compaction ${compaction.id} first kept entry ${String(compaction.firstKeptEntryId)} was not found`);
   }
 
-  const prefix = branch.slice(0, firstKeptIndex);
   const controls = new Map<string, { index: number; entry: SessionEntry }>();
-  for (const [index, entry] of prefix.entries()) {
+  for (const [index, entry] of branch.slice(0, firstKeptIndex).entries()) {
     if (entry.type === "model_change") {
       controls.set("model", { index, entry: structuredClone(entry) });
     } else if (
@@ -263,105 +257,49 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     }
   }
 
-  const selected = [
-    ...[...controls.values()].sort((left, right) => left.index - right.index).map(({ entry }) => entry),
-    ...branch.slice(firstKeptIndex).map((entry) => structuredClone(entry)),
+  const visible: Array<{ entry: SessionEntry; index: number }> = branch
+    .slice(firstKeptIndex)
+    .map((entry, offset) => ({ entry, index: firstKeptIndex + offset }))
+    .filter(({ entry }) => entry.type !== "compaction" || entry.id === compaction.id);
+
+  const ordered = [
+    ...[...controls.values()].sort((left, right) => left.index - right.index),
+    ...visible,
   ];
+
   const usedIds = new Set<string>();
-  const mappedIds = new Map<string, string>();
-  for (const entry of selected) {
+  const retained: RetainedEntry[] = ordered.map(({ entry, index }) => {
     const originalId = entry.id!;
     entry.id = freshId(usedIds);
     entry.parentId = null;
-    mappedIds.set(originalId, entry.id);
-  }
-  for (const [index, entry] of selected.entries()) {
-    entry.parentId = index === 0 ? null : selected[index - 1].id;
-    if (entry.type !== "compaction" || typeof entry.firstKeptEntryId !== "string") continue;
-    const mappedFirstKept = mappedIds.get(entry.firstKeptEntryId);
-    if (mappedFirstKept) entry.firstKeptEntryId = mappedFirstKept;
-  }
+    return { originalId, entry, index };
+  });
 
-  const rebuiltCompaction = selected.find((entry) => entry.id === mappedIds.get(compaction.id!));
-  if (!hasMaterializedTail && !mappedIds.has(compaction.firstKeptEntryId)) {
-    fail(`compaction ${compaction.id} first kept entry could not be retained`);
-  }
-  if (!rebuiltCompaction) fail(`compaction ${compaction.id} could not be retained`);
-
-  return {
-    header: structuredClone(session.header),
-    entries: selected,
-    originalCount: session.entries.length,
-    keptCount: selected.length,
-  };
+  return relinkEntries(session.header, retained, session.entries.length);
 }
 
-/** Build a new linear session while preserving conversation and compaction state. */
+/**
+ * Build the manual replacement: a plain transcript of the active branch.
+ *
+ * Keeps user messages, assistant text and thinking, control records, and the newest compaction
+ * record. Tool calls, tool results, and other entries are removed.
+ */
 export function buildSlimSession(session: ParsedSession): SlimSession {
   const branch = activeBranch(session);
-  const mappedIds = new Map<string, string>();
+  const newestCompaction = lastCompactionId(branch);
   const usedIds = new Set<string>();
-  const retained: Array<{ original: SessionEntry; entry: SessionEntry; index: number }> = [];
+  const retained: RetainedEntry[] = [];
 
   for (const [index, original] of branch.entries()) {
+    if (original.type === "compaction" && original.id !== newestCompaction) continue;
     const entry = retainedEntry(original);
     if (!entry) continue;
     entry.id = freshId(usedIds);
     entry.parentId = null;
-    mappedIds.set(original.id!, entry.id!);
-    retained.push({ original, entry, index });
+    retained.push({ originalId: original.id!, entry, index });
   }
 
-  for (let index = 0; index < retained.length; index += 1) {
-    const current = retained[index];
-    current.entry.parentId = index === 0 ? null : retained[index - 1].entry.id;
-    if (current.entry.type !== "compaction" || !current.entry.firstKeptEntryId) continue;
-
-    const mapped = mappedIds.get(current.entry.firstKeptEntryId);
-    if (mapped) {
-      current.entry.firstKeptEntryId = mapped;
-      continue;
-    }
-
-    const next = retained.slice(index + 1).find((candidate) => candidate.index > current.index);
-    if (!next) fail(`compaction ${current.original.id} points to no retained entry`);
-    current.entry.firstKeptEntryId = next.entry.id;
-  }
-
-  return {
-    header: structuredClone(session.header),
-    entries: retained.map(({ entry }) => entry),
-    originalCount: session.entries.length,
-    keptCount: retained.length,
-  };
-}
-
-/** Return the latest surgery metadata on the active branch. */
-export function latestSurgeryMetadata(session: ParsedSession): SurgeryMetadata | undefined {
-  for (const entry of [...activeBranch(session)].reverse()) {
-    if (entry.type !== "custom" || entry.customType !== SURGERY_CUSTOM_TYPE) continue;
-    const metadata = surgeryMetadataFrom(entry.data);
-    if (metadata) return metadata;
-  }
-  return undefined;
-}
-
-/** Append the link to the backup that produced a replacement session. */
-export function appendSurgeryMetadata(session: SlimSession, metadata: SurgeryMetadata): SlimSession {
-  const usedIds = new Set(session.entries.flatMap((entry) => entry.id ? [entry.id] : []));
-  const entry: SessionEntry = {
-    type: "custom",
-    id: freshId(usedIds),
-    parentId: session.entries.at(-1)?.id ?? null,
-    timestamp: metadata.createdAt,
-    customType: SURGERY_CUSTOM_TYPE,
-    data: structuredClone(metadata),
-  };
-  return {
-    ...session,
-    entries: [...session.entries, entry],
-    keptCount: session.keptCount + 1,
-  };
+  return relinkEntries(session.header, retained, session.entries.length);
 }
 
 /** Serialize a rebuilt session as newline-delimited JSON. */
@@ -370,10 +308,6 @@ export function serializeSession(session: SlimSession): Buffer {
     `${[session.header, ...session.entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     "utf8",
   );
-}
-
-function sha256(raw: Buffer): string {
-  return createHash("sha256").update(raw).digest("hex");
 }
 
 async function writeAtomic(path: string, raw: Buffer, refuseExisting: boolean): Promise<void> {
@@ -399,31 +333,6 @@ async function writeAtomic(path: string, raw: Buffer, refuseExisting: boolean): 
   await chmod(path, 0o600);
 }
 
-/** Create a private, immutable backup of the source session. */
-export async function createBackup(
-  sourcePath: string,
-  session: ParsedSession,
-  backupRoot = BACKUP_ROOT,
-): Promise<BackupResult> {
-  const stamp = new Date().toISOString().replaceAll(":", "-").replace(".", "-");
-  const directory = join(backupRoot, String(session.header.id), `${stamp}-${randomBytes(3).toString("hex")}`);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-
-  const backupPath = join(directory, "original.jsonl");
-  const manifestPath = join(directory, "manifest.json");
-  const digest = sha256(session.raw);
-  const createdAt = new Date().toISOString();
-  await writeFile(backupPath, session.raw, { flag: "wx", mode: 0o600 });
-  if (sha256(await readFile(backupPath)) !== digest) fail("backup checksum mismatch");
-
-  await writeFile(
-    manifestPath,
-    `${JSON.stringify({ version: 1, sourcePath, backupPath, sessionId: session.header.id, createdAt, byteCount: session.raw.byteLength, sha256: digest }, null, 2)}\n`,
-    { flag: "wx", mode: 0o600 },
-  );
-  return { backupPath, manifestPath, sha256: digest, createdAt };
-}
-
 const REWRITE_SUFFIX = /(?:\.(?:surgery|restored)-[^.]+)+$/u;
 const MAX_BASE_BYTES = 120;
 
@@ -435,9 +344,9 @@ function sessionBaseName(sourcePath: string): string {
 }
 
 /** Build the rewritten session path beside its source, replacing any earlier rewrite suffix. */
-export function replacementSessionPath(sourcePath: string, kind: "surgery" | "restored"): string {
+export function replacementSessionPath(sourcePath: string): string {
   const stamp = new Date().toISOString().replaceAll(":", "-").replace(".", "-");
-  const suffix = `${kind}-${stamp}-${randomBytes(3).toString("hex")}.jsonl`;
+  const suffix = `surgery-${stamp}-${randomBytes(3).toString("hex")}.jsonl`;
   return join(dirname(sourcePath), `${sessionBaseName(sourcePath)}.${suffix}`);
 }
 
@@ -447,34 +356,4 @@ export async function writeReplacementSession(path: string, session: SlimSession
   parseSession(raw, path);
   await writeAtomic(resolve(path), raw, true);
   return raw;
-}
-
-/** Read and validate a backup manifest without changing any files. */
-export async function readBackupManifest(manifestPath: string): Promise<BackupManifest> {
-  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
-  if (
-    manifest.version !== 1 ||
-    typeof manifest.sourcePath !== "string" ||
-    typeof manifest.backupPath !== "string" ||
-    typeof manifest.sessionId !== "string" ||
-    typeof manifest.createdAt !== "string" ||
-    typeof manifest.byteCount !== "number" ||
-    typeof manifest.sha256 !== "string"
-  ) fail(`${manifestPath}: invalid backup manifest`);
-  return manifest as unknown as BackupManifest;
-}
-
-/** Restore a backup to a new or existing target without changing the backup. */
-export async function restoreBackup(manifestPath: string, targetPath: string): Promise<void> {
-  const manifest = await readBackupManifest(manifestPath);
-  const backup = await readFile(manifest.backupPath);
-  if (sha256(backup) !== manifest.sha256) fail(`${manifest.backupPath}: checksum mismatch`);
-  await writeAtomic(resolve(targetPath), backup, false);
-  if (sha256(await readFile(resolve(targetPath))) !== manifest.sha256) fail(`${targetPath}: restore checksum mismatch`);
-  if (sha256(await readFile(manifest.backupPath)) !== manifest.sha256) fail(`${manifest.backupPath}: backup changed during restore`);
-}
-
-/** Return the default hidden backup location used by the extension. */
-export function defaultBackupRoot(): string {
-  return BACKUP_ROOT;
 }

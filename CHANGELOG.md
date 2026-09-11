@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Automatic surgery now forks at the compaction boundary: everything before Pi's first kept entry and every older compaction record is dropped, while the visible part is copied unchanged so the context sent to the model stays identical.
+- Remove session backups, the restore command, and the restore machinery. A rewrite no longer copies the old session; removed tool history is gone for good.
 - Trim the persisted session automatically after successful compaction while keeping Pi's post-compaction context unchanged.
 - Add the `autoAfterCompaction` setting, enabled by default, with global and trusted-project overrides.
 - Wait for queued Pi messages before trimming so Worktrunk moves are not interrupted by a session replacement.
