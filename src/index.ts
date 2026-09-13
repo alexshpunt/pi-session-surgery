@@ -1,10 +1,11 @@
-import { unlink } from "node:fs/promises";
+import { stat, unlink } from "node:fs/promises";
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { loadSessionSurgeryConfig } from "./config.js";
 
+import type { ParsedSession } from "./session.js";
 import {
   activeBranch,
   buildCompactionCheckpoint,
@@ -18,6 +19,19 @@ import {
 const COMMAND = "session-surgery";
 
 const AUTO_COMMAND = "session-surgery-auto";
+
+/** Pi throws this when a captured extension context died together with its session. */
+const STALE_CONTEXT_PREFIX = "This extension ctx is stale after session replacement or reload.";
+
+/** How a prepared replacement session ended up. */
+type SwitchOutcome = "switched" | "cancelled" | "deferred";
+
+/** What the automatic trim still has to do. */
+type AutoOutcome = SwitchOutcome | "obsolete";
+
+function isStaleContextError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith(STALE_CONTEXT_PREFIX);
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -50,6 +64,67 @@ async function previewSession(ctx: ExtensionCommandContext): Promise<{ sourcePat
   };
 }
 
+/** True while the source file still holds exactly the bytes the replacement was copied from. */
+async function sourceUnchanged(sourcePath: string, snapshot: ParsedSession): Promise<boolean> {
+  const current = await stat(sourcePath);
+  return current.size === snapshot.sourceSize && current.mtimeMs === snapshot.sourceMtimeMs;
+}
+
+/** Remove a prepared replacement that never became the active session. */
+async function removeReplacement(replacementPath: string): Promise<void> {
+  try {
+    await unlink(replacementPath);
+  } catch {
+    // Cleanup only: a replacement that is already gone is fine.
+  }
+}
+
+/**
+ * Switch to a prepared replacement session, but only while the switch cannot destroy work.
+ *
+ * Pi activates a session by aborting the active turn and dropping queued messages, and the
+ * replacement was copied from an earlier snapshot. When anything arrived since that snapshot, or
+ * work is queued, the replacement is removed and the caller retries at a quieter moment.
+ */
+async function switchToReplacement(
+  ctx: ExtensionCommandContext,
+  sourcePath: string,
+  replacementPath: string,
+  snapshot: ParsedSession,
+  trimmedMessage: string,
+): Promise<SwitchOutcome> {
+  let replacementStarted = false;
+  try {
+    if (ctx.hasPendingMessages() || !ctx.isIdle() || !(await sourceUnchanged(sourcePath, snapshot))) {
+      await removeReplacement(replacementPath);
+      return "deferred";
+    }
+
+    const switched = await ctx.switchSession(replacementPath, {
+      withSession: async (nextCtx) => {
+        replacementStarted = true;
+        try {
+          await unlink(sourcePath);
+        } catch (error) {
+          nextCtx.ui.notify(`Session replaced, but the old file was not removed: ${String(error)}`, "warning");
+          return;
+        }
+        nextCtx.ui.notify(trimmedMessage, "info");
+      },
+    });
+
+    if (switched.cancelled && !replacementStarted) {
+      await removeReplacement(replacementPath);
+      return "cancelled";
+    }
+    return "switched";
+  } catch (error) {
+    // A switch that never started leaves the prepared file behind; a started one owns it now.
+    if (!replacementStarted) await removeReplacement(replacementPath);
+    throw error;
+  }
+}
+
 /** Rewrite the session into a plain transcript after the user confirms the preview. */
 async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
   await ctx.waitForIdle();
@@ -70,20 +145,15 @@ async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
   await writeReplacementSession(replacementPath, buildSlimSession(parsed));
   SessionManager.open(replacementPath).buildSessionContext();
 
-  const switched = await ctx.switchSession(replacementPath, {
-    withSession: async (nextCtx) => {
-      try {
-        await unlink(preview.sourcePath);
-      } catch (error) {
-        nextCtx.ui.notify(`Slim session opened, but old file was not removed: ${String(error)}`, "warning");
-        return;
-      }
-      nextCtx.ui.notify("Session slimmed", "info");
-    },
-  });
-
-  if (switched.cancelled) {
-    ctx.ui.notify(`Session switch cancelled. Replacement kept at ${replacementPath}`, "warning");
+  const outcome = await switchToReplacement(ctx, preview.sourcePath, replacementPath, parsed, "Session slimmed");
+  if (outcome === "deferred") {
+    ctx.ui.notify(
+      "The session got busy or changed while the rewrite was prepared. Nothing was replaced; run /session-surgery again.",
+      "warning",
+    );
+  }
+  if (outcome === "cancelled") {
+    ctx.ui.notify("Session switch cancelled. The prepared file was removed.", "warning");
   }
 }
 
@@ -92,34 +162,24 @@ async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
  *
  * Everything before the compaction's first kept entry is invisible to the model, so it is dropped
  * with the older compaction records. The part the model can see is copied unchanged.
+ *
+ * Returns "deferred" when the switch had to wait for a quieter moment, so the caller can keep the
+ * request and retry after the next settle.
  */
-async function runAutomaticCheckpoint(compactionId: string, ctx: ExtensionCommandContext): Promise<void> {
+async function runAutomaticCheckpoint(compactionId: string, ctx: ExtensionCommandContext): Promise<AutoOutcome> {
   await ctx.waitForIdle();
   const sourcePath = ctx.sessionManager.getSessionFile();
   if (!sourcePath) throw new Error("The current session is not persisted to a file");
 
   const parsed = await readStableSession(sourcePath);
   const branch = activeBranch(parsed);
-  if (!branch.some((entry) => entry.type === "compaction" && entry.id === compactionId)) return;
+  if (!branch.some((entry) => entry.type === "compaction" && entry.id === compactionId)) return "obsolete";
 
   const replacementPath = replacementSessionPath(sourcePath);
   await writeReplacementSession(replacementPath, buildCompactionCheckpoint(parsed));
   SessionManager.open(replacementPath).buildSessionContext();
 
-  const switched = await ctx.switchSession(replacementPath, {
-    withSession: async (nextCtx) => {
-      try {
-        await unlink(sourcePath);
-      } catch (error) {
-        nextCtx.ui.notify(`Compacted session opened, but old file was not removed: ${String(error)}`, "warning");
-        return;
-      }
-      nextCtx.ui.notify("Compacted session trimmed", "info");
-    },
-  });
-  if (switched.cancelled) {
-    ctx.ui.notify(`Automatic session switch cancelled. Replacement kept at ${replacementPath}`, "warning");
-  }
+  return switchToReplacement(ctx, sourcePath, replacementPath, parsed, "Compacted session trimmed");
 }
 
 /** Register manual surgery and automatic post-compaction checkpointing. */
@@ -127,6 +187,21 @@ export default function register(pi: ExtensionAPI): void {
   let autoAfterCompaction = true;
   let pendingCompactionId: string | undefined;
   let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Keep a trim request for the next settle instead of losing it. */
+  const keepPendingCompaction = (compactionId: string): void => {
+    if (compactionId) pendingCompactionId ??= compactionId;
+  };
+
+  /** False when this context died with a replaced session or has queued work waiting. */
+  const canTrimNow = (ctx: ExtensionContext): boolean => {
+    try {
+      return !ctx.hasPendingMessages();
+    } catch (error) {
+      if (isStaleContextError(error)) return false;
+      throw error;
+    }
+  };
 
   pi.on("session_start", (_event, ctx) => {
     try {
@@ -138,17 +213,21 @@ export default function register(pi: ExtensionAPI): void {
   });
 
   const scheduleAutomaticCheckpoint = (ctx: ExtensionContext): void => {
-    if (dispatchTimer || !pendingCompactionId || ctx.hasPendingMessages()) return;
+    if (dispatchTimer || !pendingCompactionId || !canTrimNow(ctx)) return;
     dispatchTimer = setTimeout(() => {
       dispatchTimer = undefined;
-      if (ctx.hasPendingMessages()) return;
-      const compactionId = pendingCompactionId;
-      if (!compactionId) return;
-      pi.sendUserMessage(`/${AUTO_COMMAND} ${compactionId}`, {
-        deliverAs: "followUp",
-        expandPromptTemplates: true,
-      });
-      pendingCompactionId = undefined;
+      try {
+        const compactionId = pendingCompactionId;
+        if (!compactionId || !canTrimNow(ctx)) return;
+        pi.sendUserMessage(`/${AUTO_COMMAND} ${compactionId}`, {
+          deliverAs: "followUp",
+          expandPromptTemplates: true,
+        });
+        pendingCompactionId = undefined;
+      } catch (error) {
+        // A replaced session invalidates this context; the next settle retries with a fresh one.
+        if (!isStaleContextError(error)) throw error;
+      }
     }, 0);
   };
 
@@ -181,11 +260,18 @@ export default function register(pi: ExtensionAPI): void {
   pi.registerCommand(AUTO_COMMAND, {
     description: "Internal command that trims a successfully compacted session",
     handler: async (args, ctx) => {
+      const compactionId = args.trim();
       try {
-        const compactionId = args.trim();
         if (!compactionId) throw new Error("missing compaction id");
-        await runAutomaticCheckpoint(compactionId, ctx);
+        const outcome = await runAutomaticCheckpoint(compactionId, ctx);
+        if (outcome === "deferred") keepPendingCompaction(compactionId);
       } catch (error) {
+        if (isStaleContextError(error)) {
+          // The session was replaced while the trim was in flight. The replacement session keeps
+          // the same compaction, so retry there instead of reporting a failure.
+          keepPendingCompaction(compactionId);
+          return;
+        }
         ctx.ui.notify(`Automatic session surgery failed: ${String(error)}`, "error");
       }
     },

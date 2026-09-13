@@ -9,6 +9,10 @@
 - Wait for queued Pi messages before trimming so Worktrunk moves are not interrupted by a session replacement.
 - Rebuild retained assistant messages as plain transcript content so stale provider replay metadata cannot break tool use in the replacement session.
 - Replace the previous rewrite suffix in session file names so repeated automatic surgery cannot hit the file name length limit.
+- Switch only while Pi is idle with nothing queued and the source file unchanged since the copy, so a trim can no longer abort a turn that started while the replacement was being written.
+- Retry a deferred trim after the next settle instead of dropping it silently.
+- Treat a session replacement during a trim as a retry instead of reporting a stale-context failure.
+- Delete the prepared replacement when the switch is cancelled or never starts.
 
 ## 0.1.3 — 2026-08-24
 

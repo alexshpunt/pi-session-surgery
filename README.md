@@ -18,6 +18,9 @@ a plain transcript without tool history.
 - It stops without changing the session when the compaction boundary cannot be found.
 - `/session-surgery` shows a preview and always asks for confirmation.
 - The replacement is validated before Pi switches to it.
+- The switch happens only while Pi is idle with nothing queued and the source file unchanged since
+  the copy, because activating a session aborts the active turn.
+- A prepared replacement that is not used is deleted, so a cancelled switch leaves no extra file.
 - The old session file is removed only after the switch succeeds.
 - There are no backups. Tool history removed by a rewrite is gone for good.
 
@@ -37,6 +40,18 @@ with five. Pi reports the same context before and after the rewrite.
 On a session whose newest compaction kept almost the whole history, there is nothing invisible left
 to drop, and the file keeps its size. That is expected: the remaining bytes are the context the
 model is using right now.
+
+### Waiting for a quiet moment
+
+Pi activates a session by aborting the active turn and dropping queued messages. The replacement is
+copied from the session file, so anything that arrives after that copy would be lost together with
+the removed source file. The extension switches only while Pi is idle, nothing is queued, and the
+source file has not changed since the copy.
+
+When that check fails, the prepared file is deleted and the trim stays pending: the next settle
+tries again. A session replacement during a trim is handled the same way, so the request moves to
+the replacement session instead of failing with a stale-context error. `/session-surgery` reports
+the same condition and asks for a retry, because a manual rewrite is never deferred silently.
 
 ## Manual surgery behavior
 
