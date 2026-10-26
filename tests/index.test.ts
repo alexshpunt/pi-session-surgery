@@ -150,6 +150,7 @@ interface FakeCommandContext {
   ctx: any;
   notified: Array<{ message: string; level: string }>;
   switched: string[];
+  events: string[];
 }
 
 /** A command context that records the switch instead of moving the session. */
@@ -161,7 +162,9 @@ function createCommandContext(options: {
 }): FakeCommandContext {
   const notified: Array<{ message: string; level: string }> = [];
   const switched: string[] = [];
+  const events: string[] = [];
   const notify = (message: string, level: string): void => {
+    events.push("notify");
     notified.push({ message, level });
   };
   const ctx = {
@@ -170,14 +173,16 @@ function createCommandContext(options: {
     isIdle: () => options.idle ?? true,
     hasPendingMessages: () => options.pendingMessages ?? false,
     switchSession: async (path: string, switchOptions: { withSession: (nextCtx: any) => Promise<void> }) => {
+      events.push("switch");
       switched.push(path);
       if (options.cancelSwitch) return { cancelled: true };
       await switchOptions.withSession({ ui: { notify } });
+      events.push("switched");
       return { cancelled: false };
     },
     ui: { notify },
   };
-  return { ctx, notified, switched };
+  return { ctx, notified, switched, events };
 }
 
 test("registers manual and automatic session commands", () => {
@@ -356,6 +361,22 @@ test("retries a changing snapshot while idle and preserves the appended entry", 
   expect(retry.switched).toHaveLength(1);
   const entries = (await readFile(retry.switched[0], "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   expect(entries.map((entry) => entry.message)).toContainEqual(JSON.parse(appendedEntry("u3")).message);
+});
+
+test("reports the trim after the switch so Pi's own resume status is replaced", async () => {
+  const { commands } = createPi();
+  const sourcePath = await sessionFile();
+  const context = createCommandContext({ sessionFile: sourcePath });
+
+  await commands.get("session-surgery-auto")?.("c1", context.ctx);
+
+  expect(context.switched).toHaveLength(1);
+  // Pi prints "Resumed session" once switchSession resolves, so the report has to come last.
+  expect(context.events).toEqual(["switch", "switched", "notify"]);
+  expect(context.notified.map((notice) => notice.level)).toEqual(["info"]);
+  expect(context.notified[0]?.message).toMatch(
+    /^Compacted session trimmed: [\d.]+ (?:B|KB|MB) → [\d.]+ (?:B|KB|MB); the session file was replaced$/,
+  );
 });
 
 test("bounds idle retries and retains the request for the next settle", async () => {

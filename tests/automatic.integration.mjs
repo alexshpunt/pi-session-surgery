@@ -68,6 +68,16 @@ for (const [mode, behavior] of [
       assert.ok(resumed.heartbeats.length > 0);
       assert.ok(resumed.heartbeats.every((data) => data.value === 42));
     }
+    // Pi prints its own "Resumed session" status when the switch resolves, so the trim report
+    // must arrive afterwards and say what really happened.
+    const switchEnd = observations.findIndex((entry) => entry.event === "switch-end");
+    const report = observations.findIndex((entry) =>
+      entry.event === "notify" && typeof entry.message === "string"
+      && entry.message.includes("the session file was replaced"));
+    assert.ok(switchEnd >= 0, "the probe recorded the switch completing");
+    assert.ok(report > switchEnd, "the trim report is delivered after the switch completes");
+    assert.equal(observations[report].level, "info");
+    assert.match(observations[report].message, /[\d.]+ (?:B|KB|MB) → [\d.]+ (?:B|KB|MB)/);
     assert.equal(result.exitCode, 0);
   });
 }

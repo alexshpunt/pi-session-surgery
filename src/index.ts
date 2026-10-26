@@ -98,6 +98,8 @@ async function switchToReplacement(
   trimmedMessage: string,
 ): Promise<SwitchOutcome> {
   let replacementStarted = false;
+  let reportAfterSwitch: ((message: string, level: "info" | "warning") => void) | undefined;
+  let report: { message: string; level: "info" | "warning" } | undefined;
   try {
     if (
       ctx.hasPendingMessages() ||
@@ -113,13 +115,29 @@ async function switchToReplacement(
     const switched = await ctx.switchSession(replacementPath, {
       withSession: async (nextCtx) => {
         replacementStarted = true;
+        // Pi prints its own "Resumed session" status after this callback returns, so the trim
+        // report is delivered below instead of here; the replaced context stays valid for it.
+        reportAfterSwitch = (message, level) => nextCtx.ui.notify(message, level);
         try {
           await unlink(sourcePath);
         } catch (error) {
-          nextCtx.ui.notify(`Session replaced, but the old file was not removed: ${String(error)}`, "warning");
+          report = {
+            message: `Session replaced, but the old file was not removed: ${String(error)}`,
+            level: "warning",
+          };
           return;
         }
-        nextCtx.ui.notify(trimmedMessage, "info");
+        const replacementBytes = await stat(replacementPath).then(
+          (stats) => stats.size,
+          () => undefined,
+        );
+        report = {
+          message:
+            replacementBytes === undefined
+              ? `${trimmedMessage}; the session file was replaced`
+              : `${trimmedMessage}: ${formatBytes(snapshot.sourceSize)} → ${formatBytes(replacementBytes)}; the session file was replaced`,
+          level: "info",
+        };
       },
     });
 
@@ -127,6 +145,7 @@ async function switchToReplacement(
       await removeReplacement(replacementPath);
       return "cancelled";
     }
+    if (report && reportAfterSwitch) reportAfterSwitch(report.message, report.level);
     return "switched";
   } catch (error) {
     // A switch that never started leaves the prepared file behind; a started one owns it now.
