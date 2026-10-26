@@ -74,13 +74,21 @@ export function parseSession(raw: Buffer, sourcePath: string): ParsedSession {
   return { header, entries, raw, sourceSize: sourceStat.size, sourceMtimeMs: sourceStat.mtimeMs };
 }
 
+/** A live session changed during a snapshot; automatic surgery can retry later. */
+export class SessionChangedError extends Error {
+  constructor(sourcePath: string) {
+    super(`${sourcePath}: file changed while it was being read; retry when Pi is idle`);
+    this.name = "SessionChangedError";
+  }
+}
+
 /** Read a session while refusing files that change during the read. */
 export async function readStableSession(sourcePath: string): Promise<ParsedSession> {
   const before = await stat(sourcePath);
   const raw = await readFile(sourcePath);
   const after = await stat(sourcePath);
   if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-    fail(`${sourcePath}: file changed while it was being read; stop Pi and retry`);
+    throw new SessionChangedError(sourcePath);
   }
   const parsed = parseSession(raw, sourcePath);
   parsed.sourceSize = before.size;

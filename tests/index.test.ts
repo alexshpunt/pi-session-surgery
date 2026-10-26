@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,9 +9,11 @@ import register from "../src/index.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SlimSession } from "../src/session.js";
 
-/** Test hook that runs while a replacement session is being written. */
+/** Pause real filesystem operations at the race boundaries under test. */
 const sessionHooks = vi.hoisted(() => ({
   afterReplacementWritten: undefined as (() => Promise<void>) | undefined,
+  afterSourceRead: undefined as (() => Promise<void>) | undefined,
+  afterSourceStat: undefined as (() => void) | undefined,
 }));
 
 vi.mock("../src/session.js", async (importOriginal) => {
@@ -26,11 +28,31 @@ vi.mock("../src/session.js", async (importOriginal) => {
   };
 });
 
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...original,
+    readFile: async (...args: Parameters<typeof original.readFile>) => {
+      const raw = await original.readFile(...args);
+      await sessionHooks.afterSourceRead?.();
+      return raw;
+    },
+    stat: async (...args: Parameters<typeof original.stat>) => {
+      const result = await original.stat(...args);
+      sessionHooks.afterSourceStat?.();
+      return result;
+    },
+  };
+});
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   sessionHooks.afterReplacementWritten = undefined;
+  sessionHooks.afterSourceRead = undefined;
+  sessionHooks.afterSourceStat = undefined;
+  vi.useRealTimers();
 });
 
 type EventHandler = (...args: any[]) => unknown;
@@ -198,7 +220,7 @@ test("waits for queued work and keeps the trim request across a session switch",
 
   handlers.get("session_shutdown")?.({}, {});
   handlers.get("session_start")?.({ type: "session_start", reason: "switch" }, startContext());
-  handlers.get("agent_settled")?.({}, { hasPendingMessages: () => false });
+  handlers.get("agent_settled")?.({}, { isIdle: () => true, hasPendingMessages: () => false });
   await vi.runAllTimersAsync();
 
   expect(sent).toEqual([
@@ -225,6 +247,7 @@ test("keeps the trim request when the session context goes stale before dispatch
   handlers.get("agent_settled")?.(
     {},
     {
+      isIdle: () => true,
       hasPendingMessages: () => {
         if (replaced) throw staleError;
         return false;
@@ -236,7 +259,7 @@ test("keeps the trim request when the session context goes stale before dispatch
   expect(sent).toEqual([]);
 
   handlers.get("session_start")?.({ type: "session_start", reason: "switch" }, startContext());
-  handlers.get("agent_settled")?.({}, { hasPendingMessages: () => false });
+  handlers.get("agent_settled")?.({}, { isIdle: () => true, hasPendingMessages: () => false });
   await vi.runAllTimersAsync();
 
   expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto compact-1"]);
@@ -264,7 +287,7 @@ test("defers the switch while entries arrived after the snapshot and retries on 
 
   // The request stays pending, so the next settle dispatches it again.
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, startContext());
-  handlers.get("agent_settled")?.({}, { hasPendingMessages: () => false });
+  handlers.get("agent_settled")?.({}, { isIdle: () => true, hasPendingMessages: () => false });
   await vi.runAllTimersAsync();
 
   expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c1"]);
@@ -280,6 +303,176 @@ test("defers the switch while queued work is waiting", async () => {
 
   expect(deferred.switched).toEqual([]);
   expect(await leftoverReplacements(sourcePath)).toEqual([]);
+});
+
+test("dispatches after manual compaction becomes idle without another agent run", async () => {
+  vi.useFakeTimers();
+  const { handlers, sent } = createPi();
+  let idle = false;
+  handlers.get("session_compact")?.(
+    { compactionEntry: { id: "c1" } },
+    { isIdle: () => idle, hasPendingMessages: () => false },
+  );
+  idle = true;
+  await vi.runAllTimersAsync();
+  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c1"]);
+});
+
+test("lets an immediate continuation finish before dispatching surgery", async () => {
+  vi.useFakeTimers();
+  const { handlers, sent } = createPi();
+  let idle = true;
+  const ctx = { isIdle: () => idle, hasPendingMessages: () => false };
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, ctx);
+  idle = false;
+  await vi.runAllTimersAsync();
+  expect(sent).toEqual([]);
+
+  idle = true;
+  handlers.get("agent_settled")?.({}, ctx);
+  await vi.runAllTimersAsync();
+  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c1"]);
+});
+
+test("retries a changing snapshot while idle and preserves the appended entry", async () => {
+  vi.useFakeTimers();
+  const { commands, sent } = createPi();
+  const sourcePath = await sessionFile();
+  sessionHooks.afterSourceRead = async () => {
+    sessionHooks.afterSourceRead = undefined;
+    await appendFile(sourcePath, appendedEntry("u3"));
+  };
+  const first = createCommandContext({ sessionFile: sourcePath });
+  await commands.get("session-surgery-auto")?.("c1", first.ctx);
+  expect(first.switched).toEqual([]);
+  expect(first.notified).toEqual([]);
+  expect(await leftoverReplacements(sourcePath)).toEqual([]);
+
+  // No agent_settled event: an idle session still gets a bounded retry.
+  await vi.runAllTimersAsync();
+  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c1"]);
+  const retry = createCommandContext({ sessionFile: sourcePath });
+  await commands.get("session-surgery-auto")?.("c1", retry.ctx);
+  expect(retry.switched).toHaveLength(1);
+  const entries = (await readFile(retry.switched[0], "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(entries.map((entry) => entry.message)).toContainEqual(JSON.parse(appendedEntry("u3")).message);
+});
+
+test("bounds idle retries and retains the request for the next settle", async () => {
+  vi.useFakeTimers();
+  const { handlers, commands, sent } = createPi();
+  const sourcePath = await sessionFile();
+  let appended = 0;
+  sessionHooks.afterSourceRead = async () => {
+    await appendFile(sourcePath, appendedEntry("race-" + ++appended));
+  };
+  const attempt = createCommandContext({ sessionFile: sourcePath });
+  for (let i = 0; i < 4; i++) {
+    await commands.get("session-surgery-auto")?.("c1", attempt.ctx);
+    await vi.runAllTimersAsync();
+  }
+  expect(attempt.notified).toEqual([]);
+  expect(sent.length).toBeGreaterThan(0);
+  expect(sent.length).toBeLessThan(4);
+
+  const dispatched = sent.length;
+  handlers.get("agent_settled")?.({}, attempt.ctx);
+  await vi.runAllTimersAsync();
+  expect(sent).toHaveLength(dispatched + 1);
+});
+
+test("rechecks idle after the final asynchronous source validation", async () => {
+  const { commands } = createPi();
+  const sourcePath = await sessionFile();
+  let idle = true;
+  const attempt = createCommandContext({ sessionFile: sourcePath });
+  attempt.ctx.isIdle = () => idle;
+  sessionHooks.afterReplacementWritten = async () => {
+    sessionHooks.afterSourceStat = () => { idle = false; };
+  };
+  await commands.get("session-surgery-auto")?.("c1", attempt.ctx);
+  expect(attempt.switched).toEqual([]);
+  expect(attempt.notified).toEqual([]);
+  expect(await leftoverReplacements(sourcePath)).toEqual([]);
+});
+
+test("reports filesystem failures rather than treating them as a changing snapshot", async () => {
+  vi.useFakeTimers();
+  const { commands, sent } = createPi();
+  const sourcePath = await sessionFile();
+  await rm(sourcePath);
+  const attempt = createCommandContext({ sessionFile: sourcePath });
+  await commands.get("session-surgery-auto")?.("c1", attempt.ctx);
+  await vi.runAllTimersAsync();
+  expect(attempt.notified.map((notice) => notice.level)).toEqual(["error"]);
+  expect(sent).toEqual([]);
+});
+
+test("keeps the newest compaction pending until an in-flight trim finishes", async () => {
+  vi.useFakeTimers();
+  const { handlers, commands, sent } = createPi();
+  const sourcePath = await sessionFile();
+  let release!: () => void;
+  let writing!: () => void;
+  const paused = new Promise<void>((resolve) => { release = resolve; });
+  const reached = new Promise<void>((resolve) => { writing = resolve; });
+  sessionHooks.afterReplacementWritten = async () => {
+    sessionHooks.afterReplacementWritten = undefined;
+    writing();
+    await paused;
+  };
+  const first = createCommandContext({ sessionFile: sourcePath });
+  // Also cover a dispatch timer that was armed just before this command started.
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, first.ctx);
+  const running = commands.get("session-surgery-auto")!("c1", first.ctx);
+  await reached;
+  try {
+    await appendFile(sourcePath, JSON.stringify({
+      type: "compaction", id: "c2", parentId: "u2", summary: "newer summary",
+      firstKeptEntryId: "u2", tokensBefore: 20,
+    }) + "\n");
+    handlers.get("session_compact")?.({ compactionEntry: { id: "c2" } }, first.ctx);
+    handlers.get("agent_settled")?.({}, first.ctx);
+    await vi.runAllTimersAsync();
+    expect(sent).toEqual([]);
+  } finally {
+    release();
+    await running;
+  }
+  expect(first.switched).toEqual([]);
+  expect(first.notified).toEqual([]);
+  await vi.runAllTimersAsync();
+  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c2"]);
+  const next = createCommandContext({ sessionFile: sourcePath });
+  await commands.get("session-surgery-auto")!("c2", next.ctx);
+  expect(next.switched).toHaveLength(1);
+});
+
+test("does not run a second automatic command concurrently", async () => {
+  const { commands } = createPi();
+  const sourcePath = await sessionFile();
+  let release!: () => void;
+  let writing!: () => void;
+  const paused = new Promise<void>((resolve) => { release = resolve; });
+  const reached = new Promise<void>((resolve) => { writing = resolve; });
+  sessionHooks.afterReplacementWritten = async () => {
+    sessionHooks.afterReplacementWritten = undefined;
+    writing();
+    await paused;
+  };
+  const first = createCommandContext({ sessionFile: sourcePath });
+  const second = createCommandContext({ sessionFile: sourcePath });
+  const running = commands.get("session-surgery-auto")!("c1", first.ctx);
+  await reached;
+  try {
+    await commands.get("session-surgery-auto")!("c1", second.ctx);
+    expect(second.switched).toEqual([]);
+    expect(second.notified).toEqual([]);
+  } finally {
+    release();
+    await running;
+  }
+  expect(first.switched).toHaveLength(1);
 });
 
 test("removes the prepared file when the switch is cancelled", async () => {
