@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { appendFileSync, closeSync, openSync, readSync, renameSync, statSync } from "node:fs";
 import { chmod, mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -94,6 +95,19 @@ export async function readStableSession(sourcePath: string): Promise<ParsedSessi
   parsed.sourceSize = before.size;
   parsed.sourceMtimeMs = before.mtimeMs;
   return parsed;
+}
+
+/**
+ * Read a session prefix that ends on a line boundary.
+ *
+ * Pi appends whole lines with synchronous writes, so a prefix read is a valid session snapshot and
+ * everything appended after it can be carried over to the rewritten file unchanged.
+ */
+export async function readSessionPrefix(sourcePath: string): Promise<ParsedSession> {
+  const raw = await readFile(sourcePath);
+  const end = raw.lastIndexOf(0x0a);
+  if (end < 0) fail(`${sourcePath}: session has no complete line`);
+  return parseSession(raw.subarray(0, end + 1), sourcePath);
 }
 
 /** Return the active branch, ending at the last stored entry. */
@@ -400,6 +414,40 @@ export function replacementSessionPath(sourcePath: string): string {
   const stamp = new Date().toISOString().replaceAll(":", "-").replace(".", "-");
   const suffix = `surgery-${stamp}-${randomBytes(3).toString("hex")}.jsonl`;
   return join(dirname(sourcePath), `${sessionBaseName(sourcePath)}.${suffix}`);
+}
+
+/**
+ * Replace the source file with the prepared replacement, carrying over bytes appended since the
+ * prefix read.
+ *
+ * Every call here is synchronous on purpose: Pi appends session entries with synchronous writes, so
+ * a synchronous commit cannot be interleaved with an append and no entry written by Pi is lost.
+ * Returns the number of carried-over bytes.
+ */
+export function commitInPlace(sourcePath: string, replacementPath: string, prefixSize: number): number {
+  const sizeNow = statSync(sourcePath).size;
+  if (sizeNow < prefixSize) throw new SessionChangedError(sourcePath);
+  const appended = sizeNow > prefixSize ? readRange(sourcePath, prefixSize, sizeNow) : Buffer.alloc(0);
+  if (appended.byteLength > 0) appendFileSync(replacementPath, appended);
+  renameSync(replacementPath, sourcePath);
+  return appended.byteLength;
+}
+
+/** Read one byte range of a file. */
+function readRange(path: string, start: number, end: number): Buffer {
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(end - start);
+    let filled = 0;
+    while (filled < buffer.byteLength) {
+      const read = readSync(fd, buffer, filled, buffer.byteLength - filled, start + filled);
+      if (read <= 0) break;
+      filled += read;
+    }
+    return filled === buffer.byteLength ? buffer : buffer.subarray(0, filled);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Write a validated replacement session without touching the source. */

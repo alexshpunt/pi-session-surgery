@@ -1,10 +1,12 @@
-import { appendFile, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, expect, test, vi } from "vitest";
 
 import register from "../src/index.js";
+
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SlimSession } from "../src/session.js";
@@ -133,6 +135,34 @@ function appendedEntry(id: string): string {
   })}\n`;
 }
 
+/** A session whose newest compaction kept every entry, so a trim has nothing to drop. */
+async function keepingSessionFile(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "pi-session-surgery-keeping-"));
+  temporaryDirectories.push(directory);
+  const path = join(directory, "session.jsonl");
+  const entries = [
+    { type: "session", version: 3, id: "keeping-session", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/tmp" },
+    {
+      type: "message",
+      id: "u1",
+      parentId: null,
+      timestamp: "2026-01-01T00:00:01.000Z",
+      message: { role: "user", content: "first question", timestamp: 1 },
+    },
+    {
+      type: "compaction",
+      id: "keep-all",
+      parentId: "u1",
+      timestamp: "2026-01-01T00:00:02.000Z",
+      summary: "summary",
+      firstKeptEntryId: "u1",
+      tokensBefore: 10,
+    },
+  ];
+  await writeFile(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  return path;
+}
+
 async function sessionFile(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "pi-session-surgery-index-"));
   temporaryDirectories.push(directory);
@@ -185,323 +215,200 @@ function createCommandContext(options: {
   return { ctx, notified, switched, events };
 }
 
-test("registers manual and automatic session commands", () => {
-  const { commandsInOrder } = createPi();
 
-  expect(commandsInOrder).toEqual(["session-surgery", "session-surgery-auto"]);
-});
+/** A live session context: Pi's manager shows the current file and can re-read it. */
+interface FakeLiveContext {
+  ctx: any;
+  notified: Array<{ message: string; level: string }>;
+  switched: string[];
+  reopened: string[];
+}
 
-test("queues automatic surgery after a successful compaction", async () => {
-  vi.useFakeTimers();
-  const { handlers, sent } = createPi();
-
-  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, startContext());
-  handlers.get("session_compact")?.(
-    { compactionEntry: { id: "compact-1" } },
-    { isIdle: () => true, hasPendingMessages: () => false },
-  );
-  await vi.runAllTimersAsync();
-
-  expect(sent).toEqual([
-    {
-      content: "/session-surgery-auto compact-1",
-      options: { deliverAs: "followUp", expandPromptTemplates: true },
+function createLiveContext(sessionFile: string, options: { reopenable?: boolean } = {}): FakeLiveContext {
+  const notified: Array<{ message: string; level: string }> = [];
+  const switched: string[] = [];
+  const reopened: string[] = [];
+  const sessionManager: Record<string, unknown> = {
+    getSessionFile: () => sessionFile,
+    getCwd: () => "/tmp/project",
+  };
+  if (options.reopenable ?? true) {
+    sessionManager.setSessionFile = (path: string) => {
+      reopened.push(path);
+    };
+  }
+  const ctx = {
+    cwd: "/tmp/project",
+    isProjectTrusted: () => false,
+    sessionManager,
+    switchSession: async (path: string) => {
+      switched.push(path);
+      return { cancelled: false };
     },
-  ]);
-  vi.useRealTimers();
-});
-
-test("waits for queued work and keeps the trim request across a session switch", async () => {
-  vi.useFakeTimers();
-  const { handlers, sent } = createPi();
-
-  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, startContext());
-  handlers.get("session_compact")?.(
-    { compactionEntry: { id: "compact-1" } },
-    { isIdle: () => true, hasPendingMessages: () => true },
-  );
-  await vi.runAllTimersAsync();
-  expect(sent).toEqual([]);
-
-  handlers.get("session_shutdown")?.({}, {});
-  handlers.get("session_start")?.({ type: "session_start", reason: "switch" }, startContext());
-  handlers.get("agent_settled")?.({}, { isIdle: () => true, hasPendingMessages: () => false });
-  await vi.runAllTimersAsync();
-
-  expect(sent).toEqual([
-    {
-      content: "/session-surgery-auto compact-1",
-      options: { deliverAs: "followUp", expandPromptTemplates: true },
-    },
-  ]);
-  vi.useRealTimers();
-});
-
-test("keeps the trim request when the session context goes stale before dispatch", async () => {
-  vi.useFakeTimers();
-  const { handlers, sent } = createPi();
-  const staleError = new Error("This extension ctx is stale after session replacement or reload.");
-
-  let replaced = false;
-  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, startContext());
-  handlers.get("session_compact")?.(
-    { compactionEntry: { id: "compact-1" } },
-    { isIdle: () => false, hasPendingMessages: () => false },
-  );
-  // This context schedules the dispatch, then dies before the timer runs.
-  handlers.get("agent_settled")?.(
-    {},
-    {
-      isIdle: () => true,
-      hasPendingMessages: () => {
-        if (replaced) throw staleError;
-        return false;
+    ui: {
+      notify: (message: string, level: string) => {
+        notified.push({ message, level });
       },
     },
-  );
-  replaced = true;
-  await vi.runAllTimersAsync();
-  expect(sent).toEqual([]);
+  };
+  return { ctx, notified, switched, reopened };
+}
 
-  handlers.get("session_start")?.({ type: "session_start", reason: "switch" }, startContext());
-  handlers.get("agent_settled")?.({}, { isIdle: () => true, hasPendingMessages: () => false });
-  await vi.runAllTimersAsync();
+/** Wait until the fire-and-forget trim reached the state the test is about to assert. */
+async function settle(assertion: () => void | Promise<void>): Promise<void> {
+  await vi.waitFor(assertion, { timeout: 3000, interval: 10 });
+}
 
-  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto compact-1"]);
-  vi.useRealTimers();
+test("registers the manual surgery command", () => {
+  expect(createPi().commandsInOrder).toEqual(["session-surgery"]);
 });
 
-test("defers the switch while entries arrived after the snapshot and retries on the next settle", async () => {
-  vi.useFakeTimers();
-  const { handlers, commands, sent } = createPi();
+test("rewrites the session in place right after a compaction", async () => {
+  const { handlers } = createPi();
   const sourcePath = await sessionFile();
-  let appended = false;
+  const originalPath = join(await mkdtemp(join(tmpdir(), "pi-session-surgery-original-")), "session.jsonl");
+  temporaryDirectories.push(join(originalPath, ".."));
+  await writeFile(originalPath, sessionFixtureText());
+  const before = (await stat(sourcePath)).size;
+  const live = createLiveContext(sourcePath);
+
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
+  await settle(() => expect(live.reopened).toEqual([sourcePath]));
+
+  // Same file, same session, no switch, no leftover replacement.
+  expect(live.switched).toEqual([]);
+  expect(await leftoverReplacements(sourcePath)).toEqual([]);
+  expect((await stat(sourcePath)).size).toBeLessThan(before);
+  // What the model sees is unchanged.
+  expect(SessionManager.open(sourcePath).buildSessionContext()).toEqual(
+    SessionManager.open(originalPath).buildSessionContext(),
+  );
+  expect(live.notified.map((notice) => notice.level)).toEqual(["info"]);
+  expect(live.notified[0]?.message).toMatch(
+    /^Compacted session trimmed: [\d.]+ (?:B|KB|MB) → [\d.]+ (?:B|KB|MB)$/,
+  );
+});
+
+test("carries over entries appended while the trim was prepared", async () => {
+  const { handlers } = createPi();
+  const sourcePath = await sessionFile();
   sessionHooks.afterReplacementWritten = async () => {
-    if (appended) return;
-    appended = true;
+    sessionHooks.afterReplacementWritten = undefined;
     await appendFile(sourcePath, appendedEntry("u3"));
   };
+  const live = createLiveContext(sourcePath);
 
-  const first = createCommandContext({ sessionFile: sourcePath });
-  await commands.get("session-surgery-auto")?.("c1", first.ctx);
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
+  await settle(() => expect(live.reopened).toEqual([sourcePath]));
 
-  // The session moved on while the replacement was written: no switch, no leftover file.
-  expect(first.switched).toEqual([]);
-  expect(first.notified).toEqual([]);
-  expect(await leftoverReplacements(sourcePath)).toEqual([]);
-
-  // The request stays pending, so the next settle dispatches it again.
-  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, startContext());
-  handlers.get("agent_settled")?.({}, { isIdle: () => true, hasPendingMessages: () => false });
-  await vi.runAllTimersAsync();
-
-  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c1"]);
-  vi.useRealTimers();
+  const entries = (await readFile(sourcePath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(entries.map((entry) => entry.id)).toContain("u3");
+  expect(SessionManager.open(sourcePath).buildSessionContext().messages.length).toBeGreaterThan(0);
 });
 
-test("defers the switch while queued work is waiting", async () => {
-  const { commands } = createPi();
+test("ignores a compaction that is no longer in the active branch", async () => {
+  const { handlers } = createPi();
   const sourcePath = await sessionFile();
+  const before = await readFile(sourcePath, "utf8");
+  const live = createLiveContext(sourcePath);
 
-  const deferred = createCommandContext({ sessionFile: sourcePath, pendingMessages: true });
-  await commands.get("session-surgery-auto")?.("c1", deferred.ctx);
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+  handlers.get("session_compact")?.({ compactionEntry: { id: "not-in-this-session" } }, live.ctx);
+  await new Promise((resolve) => setTimeout(resolve, 50));
 
-  expect(deferred.switched).toEqual([]);
-  expect(await leftoverReplacements(sourcePath)).toEqual([]);
+  expect(live.reopened).toEqual([]);
+  expect(live.notified).toEqual([]);
+  expect(await readFile(sourcePath, "utf8")).toBe(before);
 });
 
-test("dispatches after manual compaction becomes idle without another agent run", async () => {
-  vi.useFakeTimers();
-  const { handlers, sent } = createPi();
-  let idle = false;
-  handlers.get("session_compact")?.(
-    { compactionEntry: { id: "c1" } },
-    { isIdle: () => idle, hasPendingMessages: () => false },
-  );
-  idle = true;
-  await vi.runAllTimersAsync();
-  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c1"]);
+test("leaves a session that kept all its history alone", async () => {
+  const { handlers } = createPi();
+  const keepingPath = await keepingSessionFile();
+  const before = await readFile(keepingPath, "utf8");
+  const live = createLiveContext(keepingPath);
+
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+  handlers.get("session_compact")?.({ compactionEntry: { id: "keep-all" } }, live.ctx);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  expect(live.reopened).toEqual([]);
+  expect(live.notified).toEqual([]);
+  expect(await readFile(keepingPath, "utf8")).toBe(before);
+  expect(await leftoverReplacements(keepingPath)).toEqual([]);
 });
 
-test("lets an immediate continuation finish before dispatching surgery", async () => {
-  vi.useFakeTimers();
-  const { handlers, sent } = createPi();
-  let idle = true;
-  const ctx = { isIdle: () => idle, hasPendingMessages: () => false };
-  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, ctx);
-  idle = false;
-  await vi.runAllTimersAsync();
-  expect(sent).toEqual([]);
-
-  idle = true;
-  handlers.get("agent_settled")?.({}, ctx);
-  await vi.runAllTimersAsync();
-  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c1"]);
-});
-
-test("retries a changing snapshot while idle and preserves the appended entry", async () => {
-  vi.useFakeTimers();
-  const { commands, sent } = createPi();
-  const sourcePath = await sessionFile();
-  sessionHooks.afterSourceRead = async () => {
-    sessionHooks.afterSourceRead = undefined;
-    await appendFile(sourcePath, appendedEntry("u3"));
-  };
-  const first = createCommandContext({ sessionFile: sourcePath });
-  await commands.get("session-surgery-auto")?.("c1", first.ctx);
-  expect(first.switched).toEqual([]);
-  expect(first.notified).toEqual([]);
-  expect(await leftoverReplacements(sourcePath)).toEqual([]);
-
-  // No agent_settled event: an idle session still gets a bounded retry.
-  await vi.runAllTimersAsync();
-  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c1"]);
-  const retry = createCommandContext({ sessionFile: sourcePath });
-  await commands.get("session-surgery-auto")?.("c1", retry.ctx);
-  expect(retry.switched).toHaveLength(1);
-  const entries = (await readFile(retry.switched[0], "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-  expect(entries.map((entry) => entry.message)).toContainEqual(JSON.parse(appendedEntry("u3")).message);
-});
-
-test("reports the trim after the switch so Pi's own resume status is replaced", async () => {
-  const { commands } = createPi();
-  const sourcePath = await sessionFile();
-  const context = createCommandContext({ sessionFile: sourcePath });
-
-  await commands.get("session-surgery-auto")?.("c1", context.ctx);
-
-  expect(context.switched).toHaveLength(1);
-  // Pi prints "Resumed session" once switchSession resolves, so the report has to come last.
-  expect(context.events).toEqual(["switch", "switched", "notify"]);
-  expect(context.notified.map((notice) => notice.level)).toEqual(["info"]);
-  expect(context.notified[0]?.message).toMatch(
-    /^Compacted session trimmed: [\d.]+ (?:B|KB|MB) → [\d.]+ (?:B|KB|MB); the session file was replaced$/,
-  );
-});
-
-test("bounds idle retries and retains the request for the next settle", async () => {
-  vi.useFakeTimers();
-  const { handlers, commands, sent } = createPi();
-  const sourcePath = await sessionFile();
-  let appended = 0;
-  sessionHooks.afterSourceRead = async () => {
-    await appendFile(sourcePath, appendedEntry("race-" + ++appended));
-  };
-  const attempt = createCommandContext({ sessionFile: sourcePath });
-  for (let i = 0; i < 4; i++) {
-    await commands.get("session-surgery-auto")?.("c1", attempt.ctx);
-    await vi.runAllTimersAsync();
-  }
-  expect(attempt.notified).toEqual([]);
-  expect(sent.length).toBeGreaterThan(0);
-  expect(sent.length).toBeLessThan(4);
-
-  const dispatched = sent.length;
-  handlers.get("agent_settled")?.({}, attempt.ctx);
-  await vi.runAllTimersAsync();
-  expect(sent).toHaveLength(dispatched + 1);
-});
-
-test("rechecks idle after the final asynchronous source validation", async () => {
-  const { commands } = createPi();
-  const sourcePath = await sessionFile();
-  let idle = true;
-  const attempt = createCommandContext({ sessionFile: sourcePath });
-  attempt.ctx.isIdle = () => idle;
-  sessionHooks.afterReplacementWritten = async () => {
-    sessionHooks.afterSourceStat = () => { idle = false; };
-  };
-  await commands.get("session-surgery-auto")?.("c1", attempt.ctx);
-  expect(attempt.switched).toEqual([]);
-  expect(attempt.notified).toEqual([]);
-  expect(await leftoverReplacements(sourcePath)).toEqual([]);
-});
-
-test("reports filesystem failures rather than treating them as a changing snapshot", async () => {
-  vi.useFakeTimers();
-  const { commands, sent } = createPi();
+test("reports a session file it cannot read instead of rewriting it", async () => {
+  const { handlers } = createPi();
   const sourcePath = await sessionFile();
   await rm(sourcePath);
-  const attempt = createCommandContext({ sessionFile: sourcePath });
-  await commands.get("session-surgery-auto")?.("c1", attempt.ctx);
-  await vi.runAllTimersAsync();
-  expect(attempt.notified.map((notice) => notice.level)).toEqual(["error"]);
-  expect(sent).toEqual([]);
+  const live = createLiveContext(sourcePath);
+
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
+  await settle(() => expect(live.notified.map((notice) => notice.level)).toEqual(["error"]));
+
+  expect(live.reopened).toEqual([]);
+  expect(live.notified[0]?.message).toContain("Automatic session surgery failed");
 });
 
-test("keeps the newest compaction pending until an in-flight trim finishes", async () => {
-  vi.useFakeTimers();
-  const { handlers, commands, sent } = createPi();
+test("keeps automatic surgery off when Pi cannot reopen the live file", async () => {
+  const { handlers } = createPi();
+  const sourcePath = await sessionFile();
+  const before = await readFile(sourcePath, "utf8");
+  const live = createLiveContext(sourcePath, { reopenable: false });
+
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+  expect(live.notified.map((notice) => notice.level)).toEqual(["warning"]);
+
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  expect(live.notified).toHaveLength(1);
+  expect(live.reopened).toEqual([]);
+  expect(await readFile(sourcePath, "utf8")).toBe(before);
+});
+
+test("runs one trim at a time and serves the newest request", async () => {
+  const { handlers } = createPi();
   const sourcePath = await sessionFile();
   let release!: () => void;
   let writing!: () => void;
-  const paused = new Promise<void>((resolve) => { release = resolve; });
-  const reached = new Promise<void>((resolve) => { writing = resolve; });
+  const paused = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const reached = new Promise<void>((resolve) => {
+    writing = resolve;
+  });
   sessionHooks.afterReplacementWritten = async () => {
     sessionHooks.afterReplacementWritten = undefined;
     writing();
     await paused;
   };
-  const first = createCommandContext({ sessionFile: sourcePath });
-  // Also cover a dispatch timer that was armed just before this command started.
-  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, first.ctx);
-  const running = commands.get("session-surgery-auto")!("c1", first.ctx);
+  const live = createLiveContext(sourcePath);
+
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
   await reached;
-  try {
-    await appendFile(sourcePath, JSON.stringify({
-      type: "compaction", id: "c2", parentId: "u2", summary: "newer summary",
-      firstKeptEntryId: "u2", tokensBefore: 20,
-    }) + "\n");
-    handlers.get("session_compact")?.({ compactionEntry: { id: "c2" } }, first.ctx);
-    handlers.get("agent_settled")?.({}, first.ctx);
-    await vi.runAllTimersAsync();
-    expect(sent).toEqual([]);
-  } finally {
-    release();
-    await running;
-  }
-  expect(first.switched).toEqual([]);
-  expect(first.notified).toEqual([]);
-  await vi.runAllTimersAsync();
-  expect(sent.map((message) => message.content)).toEqual(["/session-surgery-auto c2"]);
-  const next = createCommandContext({ sessionFile: sourcePath });
-  await commands.get("session-surgery-auto")!("c2", next.ctx);
-  expect(next.switched).toHaveLength(1);
+  // A second compaction lands while the first trim is still preparing its replacement.
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c2" } }, live.ctx);
+  release();
+  await settle(() => expect(live.notified.length).toBeGreaterThanOrEqual(1));
+
+  // The stale request was dropped: c2 is not in the session, so no second rewrite was attempted.
+  expect(live.reopened).toEqual([sourcePath]);
+  expect(await leftoverReplacements(sourcePath)).toEqual([]);
 });
 
-test("does not run a second automatic command concurrently", async () => {
-  const { commands } = createPi();
-  const sourcePath = await sessionFile();
-  let release!: () => void;
-  let writing!: () => void;
-  const paused = new Promise<void>((resolve) => { release = resolve; });
-  const reached = new Promise<void>((resolve) => { writing = resolve; });
-  sessionHooks.afterReplacementWritten = async () => {
-    sessionHooks.afterReplacementWritten = undefined;
-    writing();
-    await paused;
-  };
-  const first = createCommandContext({ sessionFile: sourcePath });
-  const second = createCommandContext({ sessionFile: sourcePath });
-  const running = commands.get("session-surgery-auto")!("c1", first.ctx);
-  await reached;
-  try {
-    await commands.get("session-surgery-auto")!("c1", second.ctx);
-    expect(second.switched).toEqual([]);
-    expect(second.notified).toEqual([]);
-  } finally {
-    release();
-    await running;
-  }
-  expect(first.switched).toHaveLength(1);
-});
-
-test("removes the prepared file when the switch is cancelled", async () => {
+test("removes the prepared file when the manual switch is cancelled", async () => {
   const { commands } = createPi();
   const sourcePath = await sessionFile();
 
   const cancelled = createCommandContext({ sessionFile: sourcePath, cancelSwitch: true });
-  await commands.get("session-surgery-auto")?.("c1", cancelled.ctx);
+  cancelled.ctx.hasUI = true;
+  cancelled.ctx.ui.confirm = async () => true;
+  await commands.get("session-surgery")?.("", cancelled.ctx);
 
   expect(cancelled.switched).toHaveLength(1);
   expect(await leftoverReplacements(sourcePath)).toEqual([]);
