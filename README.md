@@ -48,10 +48,18 @@ copied from the session file, so anything that arrives after that copy would be 
 the removed source file. The extension switches only while Pi is idle, nothing is queued, and the
 source file has not changed since the copy.
 
-When that check fails, the prepared file is deleted and the trim stays pending: the next settle
-tries again. A session replacement during a trim is handled the same way, so the request moves to
-the replacement session instead of failing with a stale-context error. `/session-surgery` reports
-the same condition and asks for a retry, because a manual rewrite is never deferred silently.
+After compaction, the extension checks for idle on the next event-loop tick. An immediate
+continuation takes priority; surgery waits until that run settles.
+
+If the source changes during reading or preparation, the trim stays pending and any unused
+replacement is deleted. While Pi remains idle, the extension makes up to two delayed retries.
+Further changes, active work, or queued messages leave the request pending until the next settle
+instead of repeatedly reading a busy file. Automatic rewrites run one at a time; a newer compaction
+request waits for the current attempt to finish.
+
+A session replacement during a trim also keeps the request pending rather than failing with a
+stale-context error. `/session-surgery` reports a changing session and asks for a retry, because a
+manual rewrite is never deferred silently.
 
 ## Manual surgery behavior
 
@@ -96,4 +104,8 @@ Release steps are documented in [RELEASING.md](RELEASING.md).
 ```bash
 npm install
 npm run check
+npm run test:integration
 ```
+
+Integration tests run scripted responses through a real Pi process without paid model calls.
+Set `PI_SURGERY_TEST_PI` to test another installed Pi executable.
