@@ -121,7 +121,7 @@ function freshId(used: Set<string>): string {
 }
 
 function retainedMessage(message: Record<string, any>): Record<string, any> | undefined {
-  if (message?.role === "user") return structuredClone(message);
+  if (message?.role === "user" || message?.role === "system") return structuredClone(message);
   if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined;
 
   const content = message.content.flatMap((block: Record<string, any>): Array<Record<string, any>> => {
@@ -182,6 +182,47 @@ function lastCompactionId(branch: SessionEntry[]): string | undefined {
   return undefined;
 }
 
+/** Materialize Pi's latest system checkpoint for runtimes that restore tools only from raw messages. */
+function branchWithSystemCheckpoint(session: ParsedSession): SessionEntry[] {
+  const branch = structuredClone(activeBranch(session));
+  let checkpointIndex = -1;
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    if (branch[index].type === "compaction" && branch[index].systemMessage?.role === "system") {
+      checkpointIndex = index;
+      break;
+    }
+  }
+  if (checkpointIndex < 0) return branch;
+
+  const compaction = branch[checkpointIndex];
+  const message = structuredClone(compaction.systemMessage);
+  const active = new Set<string>((message.toolsAdded ?? []).map((tool: { name: string }) => tool.name));
+  const mentioned = new Set<string>();
+  for (const entry of branch.slice(0, checkpointIndex + 1)) {
+    const system = entry.type === "compaction" ? entry.systemMessage : entry.message;
+    if (system?.role !== "system") continue;
+    for (const tool of [...(system.toolsAdded ?? []), ...(system.toolsRemoved ?? [])]) mentioned.add(tool.name);
+  }
+  // Pi distinguishes a removed extension tool from a tool it has never seen. Keep those tombstones.
+  const removed = [...mentioned].filter((name) => !active.has(name)).map((name) => ({ name }));
+  if (removed.length > 0) message.toolsRemoved = removed;
+
+  const isSystem = (entry: SessionEntry) => entry.type === "message" && entry.message?.role === "system";
+  let boundary = branch.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
+  if (boundary < 0 || Array.isArray(compaction.retainedTail)) boundary = checkpointIndex;
+
+  const usedIds = new Set(branch.map((entry) => entry.id!));
+  const checkpoint: SessionEntry = {
+    type: "message", id: freshId(usedIds), parentId: null, timestamp: compaction.timestamp, message,
+  };
+  // Keep a folded system boundary anchored to a record both rewrite modes retain.
+  if (boundary < checkpointIndex && isSystem(branch[boundary])) compaction.firstKeptEntryId = checkpoint.id;
+  return branch.flatMap((entry, index) => [
+    ...(index === boundary ? [checkpoint] : []),
+    ...(index < checkpointIndex && isSystem(entry) ? [] : [entry]),
+  ]);
+}
+
 /** Relink kept entries into one linear chain and remap compaction boundaries. */
 function relinkEntries(header: SessionEntry, retained: RetainedEntry[], originalCount: number): SlimSession {
   const mappedIds = new Map(retained.map(({ originalId, entry }) => [originalId, entry.id!]));
@@ -214,11 +255,11 @@ function relinkEntries(header: SessionEntry, retained: RetainedEntry[], original
  *
  * Pi rebuilds its context from the newest compaction: the summary plus every entry from that
  * compaction's first kept entry onwards. Nothing before that boundary is sent to the model, so
- * it is dropped here together with every older compaction record. The visible part is copied
- * as it is, so the context Pi sends to the model does not change.
+ * it is dropped here together with every older compaction record, except the controls and system
+ * state needed to resume. The visible context is copied unchanged.
  */
 export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
-  const branch = activeBranch(session);
+  const branch = branchWithSystemCheckpoint(session);
   let compactionIndex = -1;
   for (let index = branch.length - 1; index >= 0; index -= 1) {
     if (branch[index].type === "compaction") {
@@ -230,7 +271,7 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
 
   const compaction = branch[compactionIndex];
   const hasMaterializedTail = Array.isArray(compaction.retainedTail);
-  const firstKeptIndex = hasMaterializedTail
+  const firstKeptIndex = hasMaterializedTail || compaction.firstKeptEntryId === compaction.id
     ? compactionIndex
     : branch.findIndex((entry, index) => index < compactionIndex && entry.id === compaction.firstKeptEntryId);
   if (firstKeptIndex < 0) {
@@ -238,6 +279,7 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
   }
 
   const controls = new Map<string, { index: number; entry: SessionEntry }>();
+  const systemControls: Array<{ index: number; entry: SessionEntry }> = [];
   for (const [index, entry] of branch.slice(0, firstKeptIndex).entries()) {
     if (entry.type === "model_change") {
       controls.set("model", { index, entry: structuredClone(entry) });
@@ -262,6 +304,8 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
       controls.set("thinking", { index, entry: structuredClone(entry) });
     } else if (entry.type === "session_info") {
       controls.set("session-info", { index, entry: structuredClone(entry) });
+    } else if (entry.type === "message" && entry.message?.role === "system") {
+      systemControls.push({ index, entry });
     }
   }
 
@@ -271,7 +315,7 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     .filter(({ entry }) => entry.type !== "compaction" || entry.id === compaction.id);
 
   const ordered = [
-    ...[...controls.values()].sort((left, right) => left.index - right.index),
+    ...[...controls.values(), ...systemControls].sort((left, right) => left.index - right.index),
     ...visible,
   ];
 
@@ -293,7 +337,7 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
  * record. Tool calls, tool results, and other entries are removed.
  */
 export function buildSlimSession(session: ParsedSession): SlimSession {
-  const branch = activeBranch(session);
+  const branch = branchWithSystemCheckpoint(session);
   const newestCompaction = lastCompactionId(branch);
   const usedIds = new Set<string>();
   const retained: RetainedEntry[] = [];

@@ -41,6 +41,19 @@ On a session whose newest compaction kept almost the whole history, there is not
 to drop, and the file keeps its size. That is expected: the remaining bytes are the context the
 model is using right now.
 
+### Reporting the trim
+
+Pi moves to the replacement through its generic session switch and prints `Resumed session` for it.
+The extension reports the trim after that switch resolves, so the status line left on screen
+describes what actually happened instead of a session the user never asked to resume:
+
+```text
+Compacted session trimmed: 2367 KB → 420 KB; the session file was replaced
+```
+
+The report carries the before and after file size. It becomes a warning when the switch happened but
+the old file could not be removed, and `/session-surgery` reports `Session slimmed` the same way.
+
 ### Waiting for a quiet moment
 
 Pi activates a session by aborting the active turn and dropping queued messages. The replacement is

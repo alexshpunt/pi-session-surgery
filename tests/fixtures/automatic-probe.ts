@@ -34,8 +34,40 @@ export default function probe(pi: ExtensionAPI): void {
         }
       };
       if (key === "switchSession") return (...args: any[]) => {
+        const cwd = ctx.cwd;
         record(ctx, "switch", { idle: target.isIdle(), pending: target.hasPendingMessages() });
-        return target.switchSession(...args);
+        // Watch the replaced context: a report delivered there lands after Pi's own resume status.
+        const options = args[1];
+        if (options?.withSession) {
+          const withSession = options.withSession;
+          args[1] = {
+            ...options,
+            withSession: async (nextCtx: any) => {
+              await withSession(new Proxy(nextCtx, {
+                get(inner, name) {
+                  if (name === "ui") return new Proxy(inner.ui, {
+                    get(ui, method) {
+                      if (method === "notify") return (message: string, level: string) => {
+                        appendFileSync(join(cwd, "surgery-probe.jsonl"),
+                          JSON.stringify({ event: "notify", level, message }) + "\n");
+                        return ui.notify(message, level);
+                      };
+                      const value = ui[method];
+                      return typeof value === "function" ? value.bind(ui) : value;
+                    },
+                  });
+                  const value = inner[name];
+                  return typeof value === "function" ? value.bind(inner) : value;
+                },
+              }));
+            },
+          };
+        }
+        const switched = Promise.resolve(target.switchSession(...args));
+        return switched.then((result: any) => {
+          appendFileSync(join(cwd, "surgery-probe.jsonl"), JSON.stringify({ event: "switch-end" }) + "\n");
+          return result;
+        });
       };
       const value = target[key];
       return typeof value === "function" ? value.bind(target) : value;
