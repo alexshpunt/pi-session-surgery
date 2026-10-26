@@ -10,6 +10,7 @@ import {
   activeBranch,
   buildCompactionCheckpoint,
   buildSlimSession,
+  SessionChangedError,
   readStableSession,
   replacementSessionPath,
   serializeSession,
@@ -19,6 +20,9 @@ import {
 const COMMAND = "session-surgery";
 
 const AUTO_COMMAND = "session-surgery-auto";
+
+const MAX_IDLE_RETRIES = 2;
+const IDLE_RETRY_DELAY_MS = 100;
 
 /** Pi throws this when a captured extension context died together with its session. */
 const STALE_CONTEXT_PREFIX = "This extension ctx is stale after session replacement or reload.";
@@ -95,7 +99,13 @@ async function switchToReplacement(
 ): Promise<SwitchOutcome> {
   let replacementStarted = false;
   try {
-    if (ctx.hasPendingMessages() || !ctx.isIdle() || !(await sourceUnchanged(sourcePath, snapshot))) {
+    if (
+      ctx.hasPendingMessages() ||
+      !ctx.isIdle() ||
+      !(await sourceUnchanged(sourcePath, snapshot)) ||
+      ctx.hasPendingMessages() ||
+      !ctx.isIdle()
+    ) {
       await removeReplacement(replacementPath);
       return "deferred";
     }
@@ -168,6 +178,7 @@ async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
  */
 async function runAutomaticCheckpoint(compactionId: string, ctx: ExtensionCommandContext): Promise<AutoOutcome> {
   await ctx.waitForIdle();
+  if (!ctx.isIdle() || ctx.hasPendingMessages()) return "deferred";
   const sourcePath = ctx.sessionManager.getSessionFile();
   if (!sourcePath) throw new Error("The current session is not persisted to a file");
 
@@ -187,16 +198,20 @@ export default function register(pi: ExtensionAPI): void {
   let autoAfterCompaction = true;
   let pendingCompactionId: string | undefined;
   let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
+  let runningCompactionId: string | undefined;
+  let nextDispatch: { ctx: ExtensionContext; delayMs: number } | undefined;
+  // A short idle race gets another chance without polling a persistently changing file forever.
+  let idleRetriesRemaining = MAX_IDLE_RETRIES;
 
   /** Keep a trim request for the next settle instead of losing it. */
   const keepPendingCompaction = (compactionId: string): void => {
     if (compactionId) pendingCompactionId ??= compactionId;
   };
 
-  /** False when this context died with a replaced session or has queued work waiting. */
+  /** False while Pi is busy, work is queued, or this context died with a replaced session. */
   const canTrimNow = (ctx: ExtensionContext): boolean => {
     try {
-      return !ctx.hasPendingMessages();
+      return ctx.isIdle() && !ctx.hasPendingMessages();
     } catch (error) {
       if (isStaleContextError(error)) return false;
       throw error;
@@ -212,11 +227,22 @@ export default function register(pi: ExtensionAPI): void {
     }
   });
 
-  const scheduleAutomaticCheckpoint = (ctx: ExtensionContext): void => {
-    if (dispatchTimer || !pendingCompactionId || !canTrimNow(ctx)) return;
+  const scheduleAutomaticCheckpoint = (ctx: ExtensionContext, delayMs = 0): void => {
+    // session_compact fires before Pi clears its compaction state. Check idle in the timer,
+    // after onComplete has had a chance to start a continuation, not in this event handler.
+    if (runningCompactionId) {
+      // A new lifecycle event takes precedence over an older attempt's delayed retry.
+      if (!nextDispatch || delayMs === 0) nextDispatch = { ctx, delayMs };
+      return;
+    }
+    if (dispatchTimer || !pendingCompactionId) return;
     dispatchTimer = setTimeout(() => {
       dispatchTimer = undefined;
       try {
+        if (runningCompactionId) {
+          scheduleAutomaticCheckpoint(ctx, delayMs);
+          return;
+        }
         const compactionId = pendingCompactionId;
         if (!compactionId || !canTrimNow(ctx)) return;
         pi.sendUserMessage(`/${AUTO_COMMAND} ${compactionId}`, {
@@ -228,22 +254,33 @@ export default function register(pi: ExtensionAPI): void {
         // A replaced session invalidates this context; the next settle retries with a fresh one.
         if (!isStaleContextError(error)) throw error;
       }
-    }, 0);
+    }, delayMs);
+  };
+
+  const retryAutomaticCheckpoint = (compactionId: string, ctx: ExtensionContext): void => {
+    keepPendingCompaction(compactionId);
+    if (idleRetriesRemaining > 0 && canTrimNow(ctx)) {
+      idleRetriesRemaining--;
+      scheduleAutomaticCheckpoint(ctx, IDLE_RETRY_DELAY_MS);
+    }
   };
 
   pi.on("session_compact", (event, ctx) => {
     if (!autoAfterCompaction) return;
     pendingCompactionId = event.compactionEntry.id;
-    if (ctx.isIdle()) scheduleAutomaticCheckpoint(ctx);
+    idleRetriesRemaining = MAX_IDLE_RETRIES;
+    scheduleAutomaticCheckpoint(ctx);
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    idleRetriesRemaining = MAX_IDLE_RETRIES;
     scheduleAutomaticCheckpoint(ctx);
   });
 
   pi.on("session_shutdown", () => {
     if (dispatchTimer) clearTimeout(dispatchTimer);
     dispatchTimer = undefined;
+    nextDispatch = undefined;
   });
 
   pi.registerCommand(COMMAND, {
@@ -261,10 +298,18 @@ export default function register(pi: ExtensionAPI): void {
     description: "Internal command that trims a successfully compacted session",
     handler: async (args, ctx) => {
       const compactionId = args.trim();
+      if (runningCompactionId) {
+        if (compactionId && compactionId !== runningCompactionId) {
+          keepPendingCompaction(compactionId);
+          scheduleAutomaticCheckpoint(ctx);
+        }
+        return;
+      }
+      runningCompactionId = compactionId;
       try {
         if (!compactionId) throw new Error("missing compaction id");
         const outcome = await runAutomaticCheckpoint(compactionId, ctx);
-        if (outcome === "deferred") keepPendingCompaction(compactionId);
+        if (outcome === "deferred") retryAutomaticCheckpoint(compactionId, ctx);
       } catch (error) {
         if (isStaleContextError(error)) {
           // The session was replaced while the trim was in flight. The replacement session keeps
@@ -272,7 +317,16 @@ export default function register(pi: ExtensionAPI): void {
           keepPendingCompaction(compactionId);
           return;
         }
+        if (error instanceof SessionChangedError) {
+          retryAutomaticCheckpoint(compactionId, ctx);
+          return;
+        }
         ctx.ui.notify(`Automatic session surgery failed: ${String(error)}`, "error");
+      } finally {
+        runningCompactionId = undefined;
+        const next = nextDispatch;
+        nextDispatch = undefined;
+        if (next) scheduleAutomaticCheckpoint(next.ctx, next.delayMs);
       }
     },
   });
