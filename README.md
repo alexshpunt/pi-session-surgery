@@ -4,9 +4,12 @@ A Pi extension that keeps long-running sessions small on disk.
 
 Pi rebuilds the context it sends to the model from the newest compaction: the summary plus every
 entry from that compaction's first kept entry onwards. Everything before that boundary is never
-sent to the model. After a successful compaction the extension forks the session and drops exactly
-that invisible part, plus the older compaction records. The part the model can see is copied
-unchanged, so what the model receives does not change.
+sent to the model. The moment Pi reports a successful compaction, the extension rewrites the session
+file in place and drops exactly that invisible part, plus the older compaction records. The part the
+model can see is copied unchanged, so what the model receives does not change.
+
+The rewrite happens on Pi's own session file, so there is no session switch: the session keeps its
+ID, its file name, its transcript and the running turn.
 
 The manual `/session-surgery` command is more aggressive: it rewrites the whole active branch into
 a plain transcript without tool history.
@@ -14,14 +17,15 @@ a plain transcript without tool history.
 ## Safety model
 
 - Automatic surgery runs only after Pi has saved a successful compaction.
+- It rewrites the session file the session already uses, so no turn is aborted and nothing is
+  replayed or resumed.
 - It copies the visible part of the session as it is, so the context sent to the model stays the same.
 - It stops without changing the session when the compaction boundary cannot be found.
-- `/session-surgery` shows a preview and always asks for confirmation.
-- The replacement is validated before Pi switches to it.
-- The switch happens only while Pi is idle with nothing queued and the source file unchanged since
-  the copy, because activating a session aborts the active turn.
-- A prepared replacement that is not used is deleted, so a cancelled switch leaves no extra file.
-- The old session file is removed only after the switch succeeds.
+- Entries Pi writes while the rewrite is prepared are carried over, so nothing is lost.
+- The rewrite is validated as a session before it replaces the live file.
+- A prepared replacement that is not used is deleted.
+- `/session-surgery` shows a preview and always asks for confirmation; that rewrite changes what the
+  model sees, so it still moves the session to a new file.
 - There are no backups. Tool history removed by a rewrite is gone for good.
 
 ## Automatic surgery behavior
@@ -41,38 +45,32 @@ On a session whose newest compaction kept almost the whole history, there is not
 to drop, and the file keeps its size. That is expected: the remaining bytes are the context the
 model is using right now.
 
+### When it runs
+
+The trim starts the moment Pi reports the compaction, before the turn continues. There is no waiting
+for an idle moment, because nothing is aborted: Pi keeps appending to the same file afterwards.
+
+Work is split so the live file is never rewritten under Pi's feet:
+
+1. read the file up to the last complete line and build the replacement next to it;
+2. carry over every byte Pi appended in the meantime;
+3. rename the replacement onto the source and point the live session manager at that same path.
+
+Steps 2 and 3 are synchronous, and Pi appends session entries with synchronous writes, so an append
+cannot slip in between them. A newer compaction that arrives while a trim is preparing replaces the
+queued request; trims never run concurrently.
+
 ### Reporting the trim
 
-Pi moves to the replacement through its generic session switch and prints `Resumed session` for it.
-The extension reports the trim after that switch resolves, so the status line left on screen
-describes what actually happened instead of a session the user never asked to resume:
-
 ```text
-Compacted session trimmed: 2367 KB → 420 KB; the session file was replaced
+Compacted session trimmed: 2367 KB → 148 KB
 ```
 
-The report carries the before and after file size. It becomes a warning when the switch happened but
-the old file could not be removed, and `/session-surgery` reports `Session slimmed` the same way.
+The status line carries the before and after file size. The session name, its ID and its file stay
+the same, so nothing in the transcript looks like a resumed session.
 
-### Waiting for a quiet moment
-
-Pi activates a session by aborting the active turn and dropping queued messages. The replacement is
-copied from the session file, so anything that arrives after that copy would be lost together with
-the removed source file. The extension switches only while Pi is idle, nothing is queued, and the
-source file has not changed since the copy.
-
-After compaction, the extension checks for idle on the next event-loop tick. An immediate
-continuation takes priority; surgery waits until that run settles.
-
-If the source changes during reading or preparation, the trim stays pending and any unused
-replacement is deleted. While Pi remains idle, the extension makes up to two delayed retries.
-Further changes, active work, or queued messages leave the request pending until the next settle
-instead of repeatedly reading a busy file. Automatic rewrites run one at a time; a newer compaction
-request waits for the current attempt to finish.
-
-A session replacement during a trim also keeps the request pending rather than failing with a
-stale-context error. `/session-surgery` reports a changing session and asks for a retry, because a
-manual rewrite is never deferred silently.
+If Pi cannot point the live session at a rewritten file, automatic surgery turns itself off for that
+session and says so, instead of falling back to a switch.
 
 ## Manual surgery behavior
 
@@ -108,8 +106,11 @@ session instead of running with a guessed value.
 /session-surgery
 ```
 
-The package uses Pi's `switchSession()` lifecycle. It does not patch Pi's core or call reload as a
-substitute for session switching.
+Automatic surgery rewrites the live session file and shows it to Pi's session manager through
+`setSessionFile()`, which is beyond the read-only type extensions get. The extension feature-detects
+it and turns automatic surgery off when it is missing. Manual surgery keeps using the public
+`switchSession()` lifecycle. It does not patch Pi's core or call reload as a substitute for session
+switching.
 Release steps are documented in [RELEASING.md](RELEASING.md).
 
 ## Development
