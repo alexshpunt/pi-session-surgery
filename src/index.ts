@@ -233,7 +233,13 @@ async function trimAfterCompaction(compactionId: string, ctx: ExtensionContext):
     return;
   }
 
-  const carried = commitInPlace(sourcePath, replacementPath, snapshot.sourceSize);
+  let carried: number;
+  try {
+    carried = commitInPlace(sourcePath, replacementPath, snapshot.sourceSize);
+  } catch (error) {
+    await removeReplacement(replacementPath);
+    throw error;
+  }
   liveSessionManager(ctx).setSessionFile?.(sourcePath);
   ctx.ui.notify(
     `Compacted session trimmed: ${formatBytes(snapshot.sourceSize)} → ${formatBytes(replacement.byteLength + carried)}`,
