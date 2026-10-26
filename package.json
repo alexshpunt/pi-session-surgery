@@ -29,6 +29,7 @@
   },
   "scripts": {
     "test": "vitest run",
+    "test:integration": "node --test tests/automatic.integration.mjs",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
     "prepack": "npm run check",
@@ -39,9 +40,10 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.2",
-    "@earendil-works/pi-tui": "0.84.2",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
     "@types/node": "^24.0.0",
+    "pi-coding-agent-test": "0.1.4",
     "typescript": "^5.9.0",
     "vitest": "^4.0.0"
   },
