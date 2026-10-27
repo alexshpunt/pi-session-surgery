@@ -21,8 +21,9 @@ a plain transcript without tool history.
   replayed or resumed.
 - It copies the visible part of the session as it is, so the context sent to the model stays the same.
 - It stops without changing the session when the compaction boundary cannot be found.
-- Entries Pi writes while the rewrite is prepared are carried over, so nothing is lost.
-- The rewrite is validated as a session before it replaces the live file.
+- Entries Pi writes while the rewrite is prepared are carried over with their original parent IDs.
+- The rewrite, including any appended entries, is validated before it replaces the live file. If an
+  appended entry refers to discarded history, the original file is left untouched.
 - A prepared replacement that is not used is deleted.
 - `/session-surgery` shows a preview and always asks for confirmation; that rewrite changes what the
   model sees, so it still moves the session to a new file.

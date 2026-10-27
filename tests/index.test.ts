@@ -305,9 +305,28 @@ test("carries over entries appended while the trim was prepared", async () => {
 
   const entries = (await readFile(sourcePath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   expect(entries.map((entry) => entry.id)).toContain("u3");
-  expect(SessionManager.open(sourcePath).buildSessionContext().messages.length).toBeGreaterThan(0);
+  const ids = new Set(entries.slice(1).map((entry) => entry.id));
+  expect(entries.slice(1).every((entry) => entry.parentId === null || ids.has(entry.parentId))).toBe(true);
+  const context = SessionManager.open(sourcePath).buildSessionContext();
+  expect(context.messages.some((message) => message.role === "user" && message.content === "arrived during the trim")).toBe(true);
 });
 
+test("does not replace the file if an appended entry references discarded history", async () => {
+  const { handlers } = createPi();
+  const sourcePath = await sessionFile();
+  const appended = appendedEntry("u3").replace('"parentId":"c1"', '"parentId":"u1"');
+  sessionHooks.afterReplacementWritten = async () => {
+    sessionHooks.afterReplacementWritten = undefined;
+    await appendFile(sourcePath, appended);
+  };
+  const live = createLiveContext(sourcePath);
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
+  await settle(() => expect(live.notified.some((notice) => notice.level === "error")).toBe(true));
+  expect(live.reopened).toEqual([]);
+  expect(await readFile(sourcePath, "utf8")).toBe(sessionFixtureText() + appended);
+  expect(await leftoverReplacements(sourcePath)).toEqual([]);
+});
 test("ignores a compaction that is no longer in the active branch", async () => {
   const { handlers } = createPi();
   const sourcePath = await sessionFile();

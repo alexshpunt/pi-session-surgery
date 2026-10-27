@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { appendFileSync, closeSync, openSync, readSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, closeSync, openSync, readFileSync, readSync, renameSync, statSync } from "node:fs";
 import { chmod, mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -333,10 +333,9 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     ...visible,
   ];
 
-  const usedIds = new Set<string>();
+  // Entries appended during the rewrite still refer to the original IDs.
   const retained: RetainedEntry[] = ordered.map(({ entry, index }) => {
     const originalId = entry.id!;
-    entry.id = freshId(usedIds);
     entry.parentId = null;
     return { originalId, entry, index };
   });
@@ -428,7 +427,12 @@ export function commitInPlace(sourcePath: string, replacementPath: string, prefi
   const sizeNow = statSync(sourcePath).size;
   if (sizeNow < prefixSize) throw new SessionChangedError(sourcePath);
   const appended = sizeNow > prefixSize ? readRange(sourcePath, prefixSize, sizeNow) : Buffer.alloc(0);
-  if (appended.byteLength > 0) appendFileSync(replacementPath, appended);
+  if (appended.byteLength > 0) {
+    // An appended entry may refer to a branch that the checkpoint did not retain.
+    // Refuse the commit rather than replacing the source with a broken tree.
+    parseSession(Buffer.concat([readFileSync(replacementPath), appended]), sourcePath);
+    appendFileSync(replacementPath, appended);
+  }
   renameSync(replacementPath, sourcePath);
   return appended.byteLength;
 }
