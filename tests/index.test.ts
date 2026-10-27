@@ -10,6 +10,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SlimSession } from "../src/session.js";
+import { parseSession } from "../src/session.js";
 
 /** Pause real filesystem operations at the race boundaries under test. */
 const sessionHooks = vi.hoisted(() => ({
@@ -309,6 +310,51 @@ test("carries over entries appended while the trim was prepared", async () => {
   expect(entries.slice(1).every((entry) => entry.parentId === null || ids.has(entry.parentId))).toBe(true);
   const context = SessionManager.open(sourcePath).buildSessionContext();
   expect(context.messages.some((message) => message.role === "user" && message.content === "arrived during the trim")).toBe(true);
+});
+
+test("keeps the real live manager and appended parents valid across repeated compactions", async () => {
+  const { handlers } = createPi();
+  const sourcePath = await sessionFile();
+  const manager = SessionManager.open(sourcePath);
+  manager.appendModelChange("fixture", "fixture-model");
+  const live = createLiveContext(sourcePath);
+  live.ctx.sessionManager = manager;
+  const sessionId = manager.getSessionId();
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
+
+  for (let round = 1; round <= 5; round += 1) {
+    manager.appendMessage({ role: "user", content: "Discarded history. ".repeat(500), timestamp: round });
+    const boundary = manager.appendMessage({ role: "user", content: `Keep round ${round}`, timestamp: round });
+    const compactionId = manager.appendCompaction(`Summary ${round}`, boundary, 10000);
+    const before = (await stat(sourcePath)).size;
+    let appendedId: string | undefined;
+    let expectedContext: ReturnType<typeof manager.buildSessionContext> | undefined;
+    sessionHooks.afterReplacementWritten = async () => {
+      sessionHooks.afterReplacementWritten = undefined;
+      // Pi continues before the asynchronous rewrite commits, using the original leaf ID.
+      appendedId = manager.appendMessage({ role: "user", content: `During trim ${round}`, timestamp: round });
+      expectedContext = manager.buildSessionContext();
+    };
+
+    handlers.get("session_compact")?.({ compactionEntry: { id: compactionId } }, live.ctx);
+    await settle(() => expect(live.notified).toHaveLength(round));
+    expect(live.notified.at(-1)?.level, live.notified.at(-1)?.message).toBe("info");
+    const parsed = parseSession(await readFile(sourcePath), sourcePath);
+    expect(parsed.entries.filter((entry) => entry.type === "compaction").map((entry) => entry.id)).toEqual([compactionId]);
+    expect(parsed.entries.find((entry) => entry.id === appendedId)?.parentId).toBe(compactionId);
+    expect(manager.getLeafId()).toBe(appendedId);
+    expect(manager.getEntries()).toEqual(parsed.entries);
+    expect(manager.buildSessionContext()).toEqual(expectedContext);
+    expect(manager.getSessionFile()).toBe(sourcePath);
+    expect(manager.getSessionId()).toBe(sessionId);
+    expect((await stat(sourcePath)).size).toBeLessThan(before);
+
+    // A new append must use the reloaded leaf, not a stale or regenerated ID.
+    const afterId = manager.appendMessage({ role: "user", content: `After trim ${round}`, timestamp: round });
+    expect(manager.getEntry(afterId)?.parentId).toBe(appendedId);
+    parseSession(await readFile(sourcePath), sourcePath);
+  }
+  expect(await leftoverReplacements(sourcePath)).toEqual([]);
 });
 
 test("does not replace the file if an appended entry references discarded history", async () => {
