@@ -16,14 +16,19 @@ a plain transcript without tool history.
 
 ## Safety model
 
-- Automatic surgery runs only after Pi has saved a successful compaction.
-- It rewrites the session file the session already uses, so no turn is aborted and nothing is
-  replayed or resumed.
-- It copies the visible part of the session as it is, so the context sent to the model stays the same.
-- It stops without changing the session when the compaction boundary cannot be found.
-- Entries Pi writes while the rewrite is prepared are carried over with their original parent IDs.
-- The rewrite, including any appended entries, is validated before it replaces the live file. If an
-  appended entry refers to discarded history, the original file is left untouched.
+- Automatic surgery runs after Pi saves a successful compaction. Pi waits for the trim before
+  continuation messages or the next turn can append.
+- The session keeps its file and ID. No turn is aborted, replayed or resumed.
+- Before replacement, Pi must build identical context from the original and rewritten files,
+  including the system checkpoint, tool declarations and retained tool exchanges.
+- The source bytes must still match the snapshot. Navigating to another leaf or switching sessions
+  cancels the prepared rewrite.
+- Entries appended during preparation keep their original IDs and parents. A reference to discarded
+  history prevents replacement.
+- An old missing-parent record can be removed only when the latest complete checkpoint hides it
+  from the model. Visible broken history is kept; missing parents are never guessed.
+- Invalid retained history or a missing compaction boundary turns automatic surgery off for the
+  loaded session after one notification.
 - A prepared replacement that is not used is deleted.
 - `/session-surgery` shows a preview and always asks for confirmation; that rewrite changes what the
   model sees, so it still moves the session to a new file.
@@ -48,18 +53,19 @@ model is using right now.
 
 ### When it runs
 
-The trim starts the moment Pi reports the compaction, before the turn continues. There is no waiting
-for an idle moment, because nothing is aborted: Pi keeps appending to the same file afterwards.
+Pi waits for the compaction event handler to finish trimming before the turn continues. File
+preparation is asynchronous; the final validation, replacement and manager reload are synchronous.
 
-Work is split so the live file is never rewritten under Pi's feet:
+1. Read a complete-line snapshot and prepare the replacement beside the source.
+2. Check that the session, live leaf and source prefix still match; carry over any appended entries.
+3. Validate the tree and compare both contexts with Pi, then rename the replacement onto the source
+   and reload the live manager at the same path.
 
-1. read the file up to the last complete line and build the replacement next to it;
-2. carry over every byte Pi appended in the meantime;
-3. rename the replacement onto the source and point the live session manager at that same path.
+A newer compaction replaces the waiting request; trims never run concurrently. Session shutdown or
+replacement cancels obsolete work.
 
-Steps 2 and 3 are synchronous, and Pi appends session entries with synchronous writes, so an append
-cannot slip in between them. A newer compaction that arrives while a trim is preparing replaces the
-queued request; trims never run concurrently.
+These checks coordinate writes within one Pi process. Do not open the same session file for writing
+in multiple processes: another process does not participate in the commit.
 
 ### Reporting the trim
 
@@ -71,7 +77,9 @@ The status line carries the before and after file size. The session name, its ID
 the same, so nothing in the transcript looks like a resumed session.
 
 If Pi cannot point the live session at a rewritten file, automatic surgery turns itself off for that
-session and says so, instead of falling back to a switch.
+session and says so, instead of falling back to a switch. Validation failures also turn it off with
+one short explanation. Loading the session again re-enables the configured behavior; unrecoverable
+history needs investigation before retrying.
 
 ## Manual surgery behavior
 
