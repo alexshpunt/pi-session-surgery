@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -125,17 +125,6 @@ function sessionFixtureText(): string {
   return `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 }
 
-/** The visible tail of the fixture, as it appears in the session file. */
-function appendedEntry(id: string): string {
-  return `${JSON.stringify({
-    type: "message",
-    id,
-    parentId: "c1",
-    timestamp: "2026-01-01T00:00:05.000Z",
-    message: { role: "user", content: "arrived during the trim", timestamp: 3 },
-  })}\n`;
-}
-
 /** A session whose newest compaction kept every entry, so a trim has nothing to drop. */
 async function keepingSessionFile(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "pi-session-surgery-keeping-"));
@@ -229,14 +218,15 @@ function createLiveContext(sessionFile: string, options: { reopenable?: boolean 
   const notified: Array<{ message: string; level: string }> = [];
   const switched: string[] = [];
   const reopened: string[] = [];
-  const sessionManager: Record<string, unknown> = {
-    getSessionFile: () => sessionFile,
-    getCwd: () => "/tmp/project",
-  };
+  const sessionManager = SessionManager.open(sessionFile);
+  const reopen = sessionManager.setSessionFile.bind(sessionManager);
   if (options.reopenable ?? true) {
     sessionManager.setSessionFile = (path: string) => {
       reopened.push(path);
+      reopen(path);
     };
+  } else {
+    Object.defineProperty(sessionManager, "setSessionFile", { value: undefined });
   }
   const ctx = {
     cwd: "/tmp/project",
@@ -255,7 +245,7 @@ function createLiveContext(sessionFile: string, options: { reopenable?: boolean 
   return { ctx, notified, switched, reopened };
 }
 
-/** Wait until the fire-and-forget trim reached the state the test is about to assert. */
+/** Wait for an assertion at a deliberately paused filesystem boundary. */
 async function settle(assertion: () => void | Promise<void>): Promise<void> {
   await vi.waitFor(assertion, { timeout: 3000, interval: 10 });
 }
@@ -286,26 +276,26 @@ test("rewrites the session in place right after a compaction", async () => {
     SessionManager.open(originalPath).buildSessionContext(),
   );
   expect(live.notified.map((notice) => notice.level)).toEqual(["info"]);
-  expect(live.notified[0]?.message).toMatch(
-    /^Compacted session trimmed: [\d.]+ (?:B|KB|MB) → [\d.]+ (?:B|KB|MB)$/,
-  );
+  expect(live.notified[0]?.message).toContain(String(before));
+  expect(live.notified[0]?.message).toContain(String((await stat(sourcePath)).size));
 });
 
 test("carries over entries appended while the trim was prepared", async () => {
   const { handlers } = createPi();
   const sourcePath = await sessionFile();
+  const live = createLiveContext(sourcePath);
+  let appendedId: string | undefined;
   sessionHooks.afterReplacementWritten = async () => {
     sessionHooks.afterReplacementWritten = undefined;
-    await appendFile(sourcePath, appendedEntry("u3"));
+    appendedId = live.ctx.sessionManager.appendMessage({ role: "user", content: "arrived during the trim", timestamp: 3 });
   };
-  const live = createLiveContext(sourcePath);
 
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
   handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
   await settle(() => expect(live.reopened).toEqual([sourcePath]));
 
   const entries = (await readFile(sourcePath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-  expect(entries.map((entry) => entry.id)).toContain("u3");
+  expect(entries.map((entry) => entry.id)).toContain(appendedId);
   const ids = new Set(entries.slice(1).map((entry) => entry.id));
   expect(entries.slice(1).every((entry) => entry.parentId === null || ids.has(entry.parentId))).toBe(true);
   const context = SessionManager.open(sourcePath).buildSessionContext();
@@ -360,17 +350,19 @@ test("keeps the real live manager and appended parents valid across repeated com
 test("does not replace the file if an appended entry references discarded history", async () => {
   const { handlers } = createPi();
   const sourcePath = await sessionFile();
-  const appended = appendedEntry("u3").replace('"parentId":"c1"', '"parentId":"u1"');
+  const live = createLiveContext(sourcePath);
+  let sourceWithAppend: string | undefined;
   sessionHooks.afterReplacementWritten = async () => {
     sessionHooks.afterReplacementWritten = undefined;
-    await appendFile(sourcePath, appended);
+    live.ctx.sessionManager.branch("u1");
+    live.ctx.sessionManager.appendMessage({ role: "user", content: "on discarded branch", timestamp: 3 });
+    sourceWithAppend = await readFile(sourcePath, "utf8");
   };
-  const live = createLiveContext(sourcePath);
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
   handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
   await settle(() => expect(live.notified.some((notice) => notice.level === "error")).toBe(true));
   expect(live.reopened).toEqual([]);
-  expect(await readFile(sourcePath, "utf8")).toBe(sessionFixtureText() + appended);
+  expect(await readFile(sourcePath, "utf8")).toBe(sourceWithAppend);
   expect(await leftoverReplacements(sourcePath)).toEqual([]);
 });
 test("ignores a compaction that is no longer in the active branch", async () => {
@@ -407,15 +399,17 @@ test("leaves a session that kept all its history alone", async () => {
 test("reports a session file it cannot read instead of rewriting it", async () => {
   const { handlers } = createPi();
   const sourcePath = await sessionFile();
-  await rm(sourcePath);
   const live = createLiveContext(sourcePath);
+  await rm(sourcePath);
 
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
   handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
   await settle(() => expect(live.notified.map((notice) => notice.level)).toEqual(["error"]));
 
   expect(live.reopened).toEqual([]);
-  expect(live.notified[0]?.message).toContain("Automatic session surgery failed");
+  await handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
+  expect(live.notified).toHaveLength(1);
+  expect(await readdir(join(sourcePath, ".."))).not.toContain("session.jsonl");
 });
 
 test("keeps automatic surgery off when Pi cannot reopen the live file", async () => {
