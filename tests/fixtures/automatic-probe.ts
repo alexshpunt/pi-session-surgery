@@ -1,32 +1,95 @@
-import { appendFileSync, copyFileSync, existsSync, statSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, type ExtensionAPI, type ExtensionContext, type SessionManager } from "@earendil-works/pi-coding-agent";
 
 import register from "../../src/index.js";
 
-/**
- * Drive a real Pi through repeated compactions and record changes to the live session.
- *
- * The session sizes are taken while Pi still owns the file: before the trim in `session_compact`
- * and after it in `session_shutdown`.
- */
+/** Drive the real Pi and observe both sides of the awaited compaction handler. */
 export default function probe(pi: ExtensionAPI): void {
   let remainingCompactions = 0;
+  let injected = false;
+  let damaged = false;
+  let beforeContext: ReturnType<typeof buildSessionContext> | undefined;
 
-  const record = (ctx: any, event: string, data: object = {}): void => {
+  const record = (ctx: ExtensionContext, event: string, data: object = {}): void => {
     appendFileSync(join(ctx.cwd, "surgery-probe.jsonl"), JSON.stringify({ event, ...data }) + "\n");
   };
-  const sizeOf = (file: string | undefined): number => (file && existsSync(file) ? statSync(file).size : 0);
+  const contextOf = (ctx: ExtensionContext) => buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
+  const snapshot = (ctx: ExtensionContext) => {
+    const file = ctx.sessionManager.getSessionFile();
+    const entries = file && existsSync(file)
+      ? readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line)).slice(1)
+      : [];
+    const ids = new Set(entries.map((entry) => entry.id));
+    return {
+      file,
+      sessionId: ctx.sessionManager.getSessionId(),
+      leaf: ctx.sessionManager.getLeafId(),
+      size: file && existsSync(file) ? statSync(file).size : 0,
+      compactions: entries.filter((entry) => entry.type === "compaction").length,
+      orphans: entries.filter((entry) => entry.parentId !== null && !ids.has(entry.parentId)).length,
+    };
+  };
+
+  // Observe real notifications without replacing their native rendering.
+  pi.on("session_start", (_event, ctx) => {
+    const notify = ctx.ui.notify.bind(ctx.ui);
+    ctx.ui.notify = (message, level) => {
+      record(ctx, "notification", { level });
+      notify(message, level);
+    };
+  });
+
+  // Register before surgery so these measurements precede its awaited rewrite.
+  pi.on("session_compact", (_event, ctx) => {
+    if (!injected && process.env.PI_SURGERY_TEST_ORPHAN === "1") {
+      // This intentional corruption is restricted to the test's private workspace and session.
+      if (!ctx.cwd.startsWith(join(tmpdir(), "pi-surgery-integration-"))) throw new Error("Not a private test workspace");
+      const file = ctx.sessionManager.getSessionFile();
+      if (!file) throw new Error("Test session is not persisted");
+      const entries = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      if (entries[1]?.parentId !== null) throw new Error("Test session does not start with a root entry");
+      const context = contextOf(ctx);
+      const orphanId = "probe-historical-orphan";
+      entries[1].parentId = orphanId;
+      entries.splice(1, 0, {
+        type: "custom_message", id: orphanId, parentId: "probe-absent-parent",
+        timestamp: entries[0].timestamp, customType: "historical-damage",
+        content: "Old history already covered by the checkpoint.", display: true,
+      });
+      writeFileSync(file, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+      (ctx.sessionManager as SessionManager).setSessionFile(file);
+      record(ctx, "orphan-injected", { contextUnchanged: isDeepStrictEqual(context, contextOf(ctx)) });
+      injected = true;
+    }
+    if (!damaged && process.env.PI_SURGERY_TEST_BROKEN === "1") {
+      if (!ctx.cwd.startsWith(join(tmpdir(), "pi-surgery-integration-"))) throw new Error("Not a private test workspace");
+      const file = ctx.sessionManager.getSessionFile();
+      if (!file) throw new Error("Test session is not persisted");
+      const entries = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const checkpoint = [...entries].reverse().find((entry) => entry.type === "compaction");
+      if (!checkpoint) throw new Error("No checkpoint to damage");
+      checkpoint.firstKeptEntryId = "probe-missing-boundary";
+      delete checkpoint.retainedTail;
+      writeFileSync(file, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+      (ctx.sessionManager as SessionManager).setSessionFile(file);
+      record(ctx, "checkpoint-damaged");
+      damaged = true;
+    }
+    beforeContext = structuredClone(contextOf(ctx));
+    record(ctx, "before-trim", snapshot(ctx));
+  });
 
   register(pi);
 
   pi.on("session_start", (event, ctx) => {
-    // A session replacement arrives here as "resume"; the in-place trim must never produce one.
     if (event.reason === "resume") record(ctx, "resumed");
     if (event.reason !== "startup") return;
     remainingCompactions = Number(process.env.PI_SURGERY_TEST_COMPACTIONS ?? 1);
-    record(ctx, "startup", { file: ctx.sessionManager.getSessionFile() });
+    record(ctx, "startup", snapshot(ctx));
   });
 
   pi.on("agent_settled", (_event, ctx) => {
@@ -48,9 +111,8 @@ export default function probe(pi: ExtensionAPI): void {
 
   pi.on("session_compact", (_event, ctx) => {
     record(ctx, "compacted", {
-      file: ctx.sessionManager.getSessionFile(),
-      size: sizeOf(ctx.sessionManager.getSessionFile()),
-      compactions: ctx.sessionManager.getEntries().filter((entry) => entry.type === "compaction").length,
+      ...snapshot(ctx),
+      contextUnchanged: isDeepStrictEqual(beforeContext, contextOf(ctx)),
     });
   });
 
@@ -61,6 +123,6 @@ export default function probe(pi: ExtensionAPI): void {
   pi.on("session_shutdown", (_event, ctx) => {
     const file = ctx.sessionManager.getSessionFile();
     if (file) copyFileSync(file, join(ctx.cwd, "session-final.jsonl"));
-    record(ctx, "shutdown", { file, size: sizeOf(file) });
+    record(ctx, "shutdown", snapshot(ctx));
   });
 }
