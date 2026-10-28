@@ -1,7 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { appendFileSync, closeSync, openSync, readFileSync, readSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, readFileSync, renameSync } from "node:fs";
 import { chmod, mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+
+import { buildSessionContext, type SessionEntry as PiSessionEntry } from "@earendil-works/pi-coding-agent";
 
 /** A JSON object stored as one Pi session entry. */
 export type SessionEntry = Record<string, any> & {
@@ -27,12 +30,28 @@ export interface SlimSession {
   keptCount: number;
 }
 
-function fail(message: string): never {
-  throw new Error(message);
+/** A validation failure with a short, payload-free explanation for the status line. */
+export class SessionValidationError extends Error {
+  readonly reason: string;
+
+  constructor(message: string, reason = "the session history could not be validated") {
+    super(message);
+    this.name = "SessionValidationError";
+    this.reason = reason;
+  }
+}
+
+function fail(message: string, reason?: string): never {
+  throw new SessionValidationError(message, reason);
 }
 
 /** Parse and validate a Pi v3 JSONL session. */
 export function parseSession(raw: Buffer, sourcePath: string): ParsedSession {
+  return parseSessionRecords(raw, sourcePath, false);
+}
+
+/** Only automatic input may contain old orphans; every replacement must pass strict parsing. */
+function parseSessionRecords(raw: Buffer, sourcePath: string, allowMissingParents: boolean): ParsedSession {
   const text = raw.toString("utf8");
   if (!text.endsWith("\n")) fail(`${sourcePath}: JSONL must end with a newline`);
   const lines = text.split("\n").slice(0, -1);
@@ -66,8 +85,8 @@ export function parseSession(raw: Buffer, sourcePath: string): ParsedSession {
   }
 
   for (const entry of entries) {
-    if (entry.parentId !== null && !ids.has(entry.parentId!)) {
-      fail(`${sourcePath}: entry ${entry.id} points to missing parent ${entry.parentId}`);
+    if (!allowMissingParents && entry.parentId !== null && !ids.has(entry.parentId!)) {
+      fail(`${sourcePath}: entry ${entry.id} points to missing parent ${entry.parentId}`, "retained history has a missing parent");
     }
   }
 
@@ -101,13 +120,15 @@ export async function readStableSession(sourcePath: string): Promise<ParsedSessi
  * Read a session prefix that ends on a line boundary.
  *
  * Pi appends whole lines with synchronous writes, so a prefix read is a valid session snapshot and
- * everything appended after it can be carried over to the rewritten file unchanged.
+ * everything appended after it can be carried over to the rewritten file unchanged. Old missing-parent
+ * links are accepted only here; a commit must discard the damaged records, preserve Pi context and
+ * produce a strictly valid replacement.
  */
 export async function readSessionPrefix(sourcePath: string): Promise<ParsedSession> {
   const raw = await readFile(sourcePath);
   const end = raw.lastIndexOf(0x0a);
   if (end < 0) fail(`${sourcePath}: session has no complete line`);
-  return parseSession(raw.subarray(0, end + 1), sourcePath);
+  return parseSessionRecords(raw.subarray(0, end + 1), sourcePath, true);
 }
 
 /** Return the active branch, ending at the last stored entry. */
@@ -289,7 +310,7 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     ? compactionIndex
     : branch.findIndex((entry, index) => index < compactionIndex && entry.id === compaction.firstKeptEntryId);
   if (firstKeptIndex < 0) {
-    fail(`compaction ${compaction.id} first kept entry ${String(compaction.firstKeptEntryId)} was not found`);
+    fail(`compaction ${compaction.id} first kept entry ${String(compaction.firstKeptEntryId)} was not found`, "the compaction boundary is missing");
   }
 
   const controls = new Map<string, { index: number; entry: SessionEntry }>();
@@ -421,37 +442,43 @@ export function replacementSessionPath(sourcePath: string): string {
  *
  * Every call here is synchronous on purpose: Pi appends session entries with synchronous writes, so
  * a synchronous commit cannot be interleaved with an append and no entry written by Pi is lost.
+ * The source prefix and the live leaf must still match, and Pi must build the same context from both
+ * files. This does not coordinate independent OS processes writing the same session.
  * Returns the number of carried-over bytes.
  */
-export function commitInPlace(sourcePath: string, replacementPath: string, prefixSize: number): number {
-  const sizeNow = statSync(sourcePath).size;
-  if (sizeNow < prefixSize) throw new SessionChangedError(sourcePath);
-  const appended = sizeNow > prefixSize ? readRange(sourcePath, prefixSize, sizeNow) : Buffer.alloc(0);
-  if (appended.byteLength > 0) {
-    // An appended entry may refer to a branch that the checkpoint did not retain.
-    // Refuse the commit rather than replacing the source with a broken tree.
-    parseSession(Buffer.concat([readFileSync(replacementPath), appended]), sourcePath);
-    appendFileSync(replacementPath, appended);
+export function commitInPlace(
+  sourcePath: string,
+  replacementPath: string,
+  snapshot: ParsedSession,
+  expectedLeaf: string | null,
+): number {
+  const current = readFileSync(sourcePath);
+  if (!current.subarray(0, snapshot.raw.byteLength).equals(snapshot.raw)) {
+    throw new SessionChangedError(sourcePath);
   }
+  const original = parseSessionRecords(current, sourcePath, true);
+  if ((original.entries.at(-1)?.id ?? null) !== expectedLeaf) throw new SessionChangedError(sourcePath);
+
+  const appended = current.subarray(snapshot.raw.byteLength);
+  const replacement = parseSession(Buffer.concat([readFileSync(replacementPath), appended]), replacementPath);
+  // Pi stops at missing parents. Never guess a reconnection or retain a damaged visible record.
+  const originalIds = new Set(original.entries.map((entry) => entry.id));
+  const keptIds = new Set(replacement.entries.map((entry) => entry.id));
+  for (const entry of original.entries) {
+    if (entry.parentId !== null && !originalIds.has(entry.parentId!) && keptIds.has(entry.id)) {
+      fail(`cannot trim visible entry ${entry.id} with a missing parent`, "retained history has a missing parent");
+    }
+  }
+  // Detect cycles before asking Pi to traverse either tree.
+  activeBranch(original);
+  activeBranch(replacement);
+  const context = (session: ParsedSession) => buildSessionContext(session.entries as PiSessionEntry[]);
+  if (!isDeepStrictEqual(context(original), context(replacement))) {
+    fail("replacement would change Pi's current context", "the replacement would change the current context");
+  }
+  if (appended.byteLength > 0) appendFileSync(replacementPath, appended);
   renameSync(replacementPath, sourcePath);
   return appended.byteLength;
-}
-
-/** Read one byte range of a file. */
-function readRange(path: string, start: number, end: number): Buffer {
-  const fd = openSync(path, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(end - start);
-    let filled = 0;
-    while (filled < buffer.byteLength) {
-      const read = readSync(fd, buffer, filled, buffer.byteLength - filled, start + filled);
-      if (read <= 0) break;
-      filled += read;
-    }
-    return filled === buffer.byteLength ? buffer : buffer.subarray(0, filled);
-  } finally {
-    closeSync(fd);
-  }
 }
 
 /** Write a validated replacement session without touching the source. */
