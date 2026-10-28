@@ -15,6 +15,8 @@ import {
   readStableSession,
   replacementSessionPath,
   serializeSession,
+  SessionChangedError,
+  SessionValidationError,
   writeReplacementSession,
 } from "./session.js";
 
@@ -91,8 +93,8 @@ async function sourceUnchanged(sourcePath: string, snapshot: ParsedSession): Pro
 async function removeReplacement(replacementPath: string): Promise<void> {
   try {
     await unlink(replacementPath);
-  } catch {
-    // Cleanup only: a replacement that is already gone is fine.
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
   }
 }
 
@@ -209,51 +211,58 @@ async function runSurgery(ctx: ExtensionCommandContext): Promise<void> {
  * its ID and its transcript. Nothing is aborted, which is what lets this run the moment Pi reports
  * the compaction instead of at some later quiet moment.
  */
-async function trimAfterCompaction(compactionId: string, ctx: ExtensionContext): Promise<void> {
+async function trimAfterCompaction(
+  compactionId: string,
+  ctx: ExtensionContext,
+  isCurrent: () => boolean,
+  notify: ExtensionContext["ui"]["notify"],
+): Promise<void> {
   const sourcePath = ctx.sessionManager.getSessionFile();
+  const sessionId = ctx.sessionManager.getSessionId();
   if (!sourcePath) throw new Error("The current session is not persisted to a file");
 
   const snapshot = await readSessionPrefix(sourcePath);
+  if (!isCurrent() || ctx.sessionManager.getSessionFile() !== sourcePath ||
+    ctx.sessionManager.getSessionId() !== sessionId ||
+    ctx.sessionManager.getLeafId() !== (snapshot.entries.at(-1)?.id ?? null)) return;
   const branch = activeBranch(snapshot);
-  // A newer compaction owns the trim now; its own request is already queued.
-  if (!branch.some((entry) => entry.type === "compaction" && entry.id === compactionId)) return;
+  if (!branch.some((entry) => entry.type === "compaction" && entry.id === compactionId)) {
+    if (branch[0]?.parentId && snapshot.entries.some((entry) => entry.id === compactionId)) {
+      throw new SessionValidationError("active history cannot reach its compaction", "retained history has a missing parent");
+    }
+    return;
+  }
 
   const replacementPath = replacementSessionPath(sourcePath);
-  const replacement = await writeReplacementSession(replacementPath, buildCompactionCheckpoint(snapshot));
-  if (replacement.byteLength >= snapshot.sourceSize) {
-    // The newest compaction kept everything, so there is no invisible history left to drop.
-    await removeReplacement(replacementPath);
-    return;
-  }
-  // Validate the replacement as a session before it becomes the live file.
-  SessionManager.open(replacementPath).buildSessionContext();
-
-  if (ctx.sessionManager.getSessionFile() !== sourcePath || !supportsInPlaceTrim(ctx)) {
-    await removeReplacement(replacementPath);
-    return;
-  }
-
-  let carried: number;
   try {
-    carried = commitInPlace(sourcePath, replacementPath, snapshot.sourceSize);
-  } catch (error) {
+    const replacement = await writeReplacementSession(replacementPath, buildCompactionCheckpoint(snapshot));
+    if (replacement.byteLength >= snapshot.sourceSize) return;
+    if (!isCurrent() || ctx.sessionManager.getSessionFile() !== sourcePath ||
+      ctx.sessionManager.getSessionId() !== sessionId || !supportsInPlaceTrim(ctx)) return;
+
+    // No await between the final source/leaf/context checks, rename and live-manager reload.
+    const carried = commitInPlace(sourcePath, replacementPath, snapshot, ctx.sessionManager.getLeafId());
+    liveSessionManager(ctx).setSessionFile?.(sourcePath);
+    notify(
+      `Compacted session trimmed: ${formatBytes(snapshot.sourceSize)} → ${formatBytes(replacement.byteLength + carried)}`,
+      "info",
+    );
+  } finally {
     await removeReplacement(replacementPath);
-    throw error;
   }
-  liveSessionManager(ctx).setSessionFile?.(sourcePath);
-  ctx.ui.notify(
-    `Compacted session trimmed: ${formatBytes(snapshot.sourceSize)} → ${formatBytes(replacement.byteLength + carried)}`,
-    "info",
-  );
 }
 
 /** Register manual surgery and automatic post-compaction checkpointing. */
 export default function register(pi: ExtensionAPI): void {
   let autoAfterCompaction = true;
-  let pendingCompactionId: string | undefined;
-  let trimming = false;
+  let generation = 0;
+  let pending: { id: string; ctx: ExtensionContext; generation: number } | undefined;
+  let trimming: Promise<void> | undefined;
+  const notices: Array<() => void> = [];
 
   pi.on("session_start", (_event, ctx) => {
+    generation += 1;
+    pending = undefined;
     try {
       autoAfterCompaction = loadSessionSurgeryConfig(ctx.cwd, getAgentDir(), ctx.isProjectTrusted()).autoAfterCompaction;
     } catch (error) {
@@ -269,38 +278,52 @@ export default function register(pi: ExtensionAPI): void {
     }
   });
 
-  /** Run queued trims one at a time; a newer compaction replaces the waiting request. */
-  const runPendingTrim = (ctx: ExtensionContext): void => {
-    if (trimming) return;
-    trimming = true;
-    void (async () => {
-      try {
-        while (pendingCompactionId) {
-          const compactionId = pendingCompactionId;
-          pendingCompactionId = undefined;
-          await trimAfterCompaction(compactionId, ctx);
+  /** Coalesce waiting requests, keeping each context tied to its session lifetime. */
+  const runPendingTrim = async (): Promise<void> => {
+    try {
+      while (pending) {
+        const request = pending;
+        pending = undefined;
+        const isCurrent = () => generation === request.generation && autoAfterCompaction;
+        // Pi rebuilds its chat after session_compact handlers return. Render notices afterwards,
+        // without delaying the commit or leaking them into a different loaded session.
+        const notify: ExtensionContext["ui"]["notify"] = (...args) => {
+          const sessionId = request.ctx.sessionManager.getSessionId();
+          notices.push(() => {
+            if (generation === request.generation && request.ctx.sessionManager.getSessionId() === sessionId) {
+              request.ctx.ui.notify(...args);
+            }
+          });
+        };
+        try {
+          await trimAfterCompaction(request.id, request.ctx, isCurrent, notify);
+        } catch (error) {
+          if (!isCurrent() || isStaleContextError(error) || error instanceof SessionChangedError) continue;
+          autoAfterCompaction = false;
+          pending = undefined;
+          const reason = error instanceof SessionValidationError ? error.reason : "the session file could not be read or rewritten";
+          notify(`Automatic session surgery is off for this session: ${reason}.`, "error");
         }
-      } catch (error) {
-        // The session was replaced or reloaded while the trim was in flight; its own compaction
-        // request, if any, arrives with a fresh context.
-        if (!isStaleContextError(error)) {
-          ctx.ui.notify(`Automatic session surgery failed: ${String(error)}`, "error");
-        }
-      } finally {
-        trimming = false;
       }
-    })();
+    } finally {
+      // Release the worker in the same microtask as the final pending check.
+      trimming = undefined;
+    }
   };
 
-  pi.on("session_compact", (event, ctx) => {
+  pi.on("session_compact", async (event, ctx) => {
     if (!autoAfterCompaction) return;
-    pendingCompactionId = event.compactionEntry.id;
-    // Pi awaits this handler, so the trim runs after it returns and never holds up the turn.
-    runPendingTrim(ctx);
+    pending = { id: event.compactionEntry.id, ctx, generation };
+    // Pi awaits this event before onComplete messages and the next turn can append.
+    if (!trimming) trimming = runPendingTrim();
+    await trimming;
+    const ready = notices.splice(0);
+    if (ready.length) setTimeout(() => { for (const notify of ready) notify(); }, 0);
   });
 
   pi.on("session_shutdown", () => {
-    pendingCompactionId = undefined;
+    generation += 1;
+    pending = undefined;
   });
 
   pi.registerCommand(COMMAND, {
