@@ -103,6 +103,11 @@ for (const scenario of ["normal", "orphan", "broken-checkpoint"]) {
     for (const id of [...Array.from({ length: rounds }, (_, round) => `history-${round}`), "result"]) {
       assert.equal(getToolExecution(result, id).isError, false, `${id} executed successfully`);
     }
+    if (!brokenCheckpoint) {
+      // These are fixture values, not notification wording. The first trim must reach the terminal.
+      assert.ok(result.terminalOutput.includes(`${(before[0].size / 1024).toFixed(1)} KB`));
+      assert.ok(result.terminalOutput.includes(`${(after[0].size / 1024).toFixed(1)} KB`));
+    }
     assert.equal(result.exitCode, 0);
   });
 }

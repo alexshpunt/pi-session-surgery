@@ -64,7 +64,10 @@ async function setup(options: { orphan?: boolean; visibleEdit?: boolean } = {}) 
     ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
   };
   handlers.get("session_start")!({ reason: "startup" }, ctx);
-  const compact = () => handlers.get("session_compact")!({ compactionEntry: { id: "checkpoint" } }, ctx);
+  const compact = async () => {
+    await handlers.get("session_compact")!({ compactionEntry: { id: "checkpoint" } }, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
   // Let an old fire-and-forget implementation finish too, so failures do not race cleanup.
   const settle = async () => { await new Promise((resolve) => setTimeout(resolve, 100)); };
   const leftovers = async () => (await readdir(directory)).filter((name) => name !== "session.jsonl");
@@ -161,9 +164,19 @@ test.each([0, 1, 2, 3, 4, 5, 6])("drains a request arriving %s microtasks after 
   for (let i = 0; i < 10; i += 1) await Promise.resolve();
   expect(completion).toBeInstanceOf(Promise);
   await completion;
+  await new Promise((resolve) => setTimeout(resolve, 0));
   expect(next.notifications.map((notice) => notice.level)).toEqual(["info"]);
   expect(next.manager.getEntry("old")).toBeUndefined();
   expect(await next.leftovers()).toEqual([]);
+});
+
+test.each(["session_shutdown", "session_start"])("discards a deferred notice after %s", async (event) => {
+  const live = await setup();
+  await live.handlers.get("session_compact")!({ compactionEntry: { id: "checkpoint" } }, live.ctx);
+  live.handlers.get(event)!({ reason: "resume" }, live.ctx);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(live.notifications).toEqual([]);
+  expect(live.manager.getEntry("old")).toBeUndefined();
 });
 
 test("cancels prepared work when its session shuts down", async () => {
