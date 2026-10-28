@@ -11,6 +11,7 @@ import register from "../../src/index.js";
 export default function probe(pi: ExtensionAPI): void {
   let remainingCompactions = 0;
   let injected = false;
+  let damaged = false;
   let beforeContext: ReturnType<typeof buildSessionContext> | undefined;
 
   const record = (ctx: ExtensionContext, event: string, data: object = {}): void => {
@@ -33,6 +34,15 @@ export default function probe(pi: ExtensionAPI): void {
     };
   };
 
+  // Observe real notifications without replacing their native rendering.
+  pi.on("session_start", (_event, ctx) => {
+    const notify = ctx.ui.notify.bind(ctx.ui);
+    ctx.ui.notify = (message, level) => {
+      record(ctx, "notification", { level });
+      notify(message, level);
+    };
+  });
+
   // Register before surgery so these measurements precede its awaited rewrite.
   pi.on("session_compact", (_event, ctx) => {
     if (!injected && process.env.PI_SURGERY_TEST_ORPHAN === "1") {
@@ -54,6 +64,20 @@ export default function probe(pi: ExtensionAPI): void {
       (ctx.sessionManager as SessionManager).setSessionFile(file);
       record(ctx, "orphan-injected", { contextUnchanged: isDeepStrictEqual(context, contextOf(ctx)) });
       injected = true;
+    }
+    if (!damaged && process.env.PI_SURGERY_TEST_BROKEN === "1") {
+      if (!ctx.cwd.startsWith(join(tmpdir(), "pi-surgery-integration-"))) throw new Error("Not a private test workspace");
+      const file = ctx.sessionManager.getSessionFile();
+      if (!file) throw new Error("Test session is not persisted");
+      const entries = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const checkpoint = [...entries].reverse().find((entry) => entry.type === "compaction");
+      if (!checkpoint) throw new Error("No checkpoint to damage");
+      checkpoint.firstKeptEntryId = "probe-missing-boundary";
+      delete checkpoint.retainedTail;
+      writeFileSync(file, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+      (ctx.sessionManager as SessionManager).setSessionFile(file);
+      record(ctx, "checkpoint-damaged");
+      damaged = true;
     }
     beforeContext = structuredClone(contextOf(ctx));
     record(ctx, "before-trim", snapshot(ctx));
