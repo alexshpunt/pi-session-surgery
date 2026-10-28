@@ -73,8 +73,9 @@ in multiple processes: another process does not participate in the commit.
 Compacted session trimmed: 2367 KB → 148 KB
 ```
 
-The status line carries the before and after file size. The session name, its ID and its file stay
-the same, so nothing in the transcript looks like a resumed session.
+The status line carries the before and after file size. It appears after Pi rebuilds the compacted
+chat; switching sessions before it appears cancels the notice. The session name, its ID and its file
+stay the same, so nothing in the transcript looks like a resumed session.
 
 If Pi cannot point the live session at a rewritten file, automatic surgery turns itself off for that
 session and says so, instead of falling back to a switch. Validation failures also turn it off with
