@@ -215,6 +215,7 @@ async function trimAfterCompaction(
   compactionId: string,
   ctx: ExtensionContext,
   isCurrent: () => boolean,
+  notify: ExtensionContext["ui"]["notify"],
 ): Promise<void> {
   const sourcePath = ctx.sessionManager.getSessionFile();
   const sessionId = ctx.sessionManager.getSessionId();
@@ -242,7 +243,7 @@ async function trimAfterCompaction(
     // No await between the final source/leaf/context checks, rename and live-manager reload.
     const carried = commitInPlace(sourcePath, replacementPath, snapshot, ctx.sessionManager.getLeafId());
     liveSessionManager(ctx).setSessionFile?.(sourcePath);
-    ctx.ui.notify(
+    notify(
       `Compacted session trimmed: ${formatBytes(snapshot.sourceSize)} → ${formatBytes(replacement.byteLength + carried)}`,
       "info",
     );
@@ -257,6 +258,7 @@ export default function register(pi: ExtensionAPI): void {
   let generation = 0;
   let pending: { id: string; ctx: ExtensionContext; generation: number } | undefined;
   let trimming: Promise<void> | undefined;
+  const notices: Array<() => void> = [];
 
   pi.on("session_start", (_event, ctx) => {
     generation += 1;
@@ -283,14 +285,24 @@ export default function register(pi: ExtensionAPI): void {
         const request = pending;
         pending = undefined;
         const isCurrent = () => generation === request.generation && autoAfterCompaction;
+        // Pi rebuilds its chat after session_compact handlers return. Render notices afterwards,
+        // without delaying the commit or leaking them into a different loaded session.
+        const notify: ExtensionContext["ui"]["notify"] = (...args) => {
+          const sessionId = request.ctx.sessionManager.getSessionId();
+          notices.push(() => {
+            if (generation === request.generation && request.ctx.sessionManager.getSessionId() === sessionId) {
+              request.ctx.ui.notify(...args);
+            }
+          });
+        };
         try {
-          await trimAfterCompaction(request.id, request.ctx, isCurrent);
+          await trimAfterCompaction(request.id, request.ctx, isCurrent, notify);
         } catch (error) {
           if (!isCurrent() || isStaleContextError(error) || error instanceof SessionChangedError) continue;
           autoAfterCompaction = false;
           pending = undefined;
           const reason = error instanceof SessionValidationError ? error.reason : "the session file could not be read or rewritten";
-          request.ctx.ui.notify(`Automatic session surgery is off for this session: ${reason}.`, "error");
+          notify(`Automatic session surgery is off for this session: ${reason}.`, "error");
         }
       }
     } finally {
@@ -305,6 +317,8 @@ export default function register(pi: ExtensionAPI): void {
     // Pi awaits this event before onComplete messages and the next turn can append.
     if (!trimming) trimming = runPendingTrim();
     await trimming;
+    const ready = notices.splice(0);
+    if (ready.length) setTimeout(() => { for (const notify of ready) notify(); }, 0);
   });
 
   pi.on("session_shutdown", () => {
