@@ -9,7 +9,20 @@ import { afterEach, expect, test, vi } from "vitest";
 import register from "../src/index.js";
 import { parseSession, type SlimSession } from "../src/session.js";
 
-const hooks = vi.hoisted(() => ({ prepared: undefined as ((path: string) => Promise<void>) | undefined }));
+const hooks = vi.hoisted(() => ({
+  prepared: undefined as ((path: string) => Promise<void>) | undefined,
+  cleaned: undefined as (() => void) | undefined,
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...original,
+    unlink: async (path: string) => {
+      try { return await original.unlink(path); }
+      finally { hooks.cleaned?.(); }
+    },
+  };
+});
 vi.mock("../src/session.js", async (importOriginal) => {
   const original = await importOriginal<typeof import("../src/session.js")>();
   return {
@@ -25,6 +38,7 @@ vi.mock("../src/session.js", async (importOriginal) => {
 const directories: string[] = [];
 afterEach(async () => {
   hooks.prepared = undefined;
+  hooks.cleaned = undefined;
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
@@ -128,6 +142,28 @@ test("refuses a valid replacement whose visible context differs from Pi's", asyn
   expect((await readFile(live.path)).equals(live.original)).toBe(true);
   expect(live.manager.buildSessionContext()).toEqual(before);
   expect(await live.leftovers()).toEqual([]);
+});
+
+test.each([0, 1, 2, 3, 4, 5, 6])("drains a request arriving %s microtasks after cleanup", async (delay) => {
+  const first = await setup();
+  const next = await setup();
+  let completion: Promise<void> | undefined;
+  hooks.cleaned = () => {
+    hooks.cleaned = undefined;
+    const enqueue = (remaining: number) => queueMicrotask(() => {
+      if (remaining) enqueue(remaining - 1);
+      else completion = first.handlers.get("session_compact")!({ compactionEntry: { id: "checkpoint" } }, next.ctx);
+    });
+    enqueue(delay);
+  };
+  await first.compact();
+  // Flush the scheduled arrival without depending on the worker's internal promise shape.
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  expect(completion).toBeInstanceOf(Promise);
+  await completion;
+  expect(next.notifications.map((notice) => notice.level)).toEqual(["info"]);
+  expect(next.manager.getEntry("old")).toBeUndefined();
+  expect(await next.leftovers()).toEqual([]);
 });
 
 test("cancels prepared work when its session shuts down", async () => {
