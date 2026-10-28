@@ -278,19 +278,24 @@ export default function register(pi: ExtensionAPI): void {
 
   /** Coalesce waiting requests, keeping each context tied to its session lifetime. */
   const runPendingTrim = async (): Promise<void> => {
-    while (pending) {
-      const request = pending;
-      pending = undefined;
-      const isCurrent = () => generation === request.generation && autoAfterCompaction;
-      try {
-        await trimAfterCompaction(request.id, request.ctx, isCurrent);
-      } catch (error) {
-        if (!isCurrent() || isStaleContextError(error) || error instanceof SessionChangedError) continue;
-        autoAfterCompaction = false;
+    try {
+      while (pending) {
+        const request = pending;
         pending = undefined;
-        const reason = error instanceof SessionValidationError ? error.reason : "the session file could not be read or rewritten";
-        request.ctx.ui.notify(`Automatic session surgery is off for this session: ${reason}.`, "error");
+        const isCurrent = () => generation === request.generation && autoAfterCompaction;
+        try {
+          await trimAfterCompaction(request.id, request.ctx, isCurrent);
+        } catch (error) {
+          if (!isCurrent() || isStaleContextError(error) || error instanceof SessionChangedError) continue;
+          autoAfterCompaction = false;
+          pending = undefined;
+          const reason = error instanceof SessionValidationError ? error.reason : "the session file could not be read or rewritten";
+          request.ctx.ui.notify(`Automatic session surgery is off for this session: ${reason}.`, "error");
+        }
       }
+    } finally {
+      // Release the worker in the same microtask as the final pending check.
+      trimming = undefined;
     }
   };
 
@@ -298,7 +303,7 @@ export default function register(pi: ExtensionAPI): void {
     if (!autoAfterCompaction) return;
     pending = { id: event.compactionEntry.id, ctx, generation };
     // Pi awaits this event before onComplete messages and the next turn can append.
-    if (!trimming) trimming = runPendingTrim().finally(() => { trimming = undefined; });
+    if (!trimming) trimming = runPendingTrim();
     await trimming;
   });
 
