@@ -372,8 +372,7 @@ test("ignores a compaction that is no longer in the active branch", async () => 
   const live = createLiveContext(sourcePath);
 
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
-  handlers.get("session_compact")?.({ compactionEntry: { id: "not-in-this-session" } }, live.ctx);
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await handlers.get("session_compact")?.({ compactionEntry: { id: "not-in-this-session" } }, live.ctx);
 
   expect(live.reopened).toEqual([]);
   expect(live.notified).toEqual([]);
@@ -386,9 +385,24 @@ test("leaves a session that kept all its history alone", async () => {
   const before = await readFile(keepingPath, "utf8");
   const live = createLiveContext(keepingPath);
 
+  let releaseReplacement!: () => void;
+  let replacementWritten!: () => void;
+  const written = new Promise<void>((resolve) => { replacementWritten = resolve; });
+  const release = new Promise<void>((resolve) => { releaseReplacement = resolve; });
+  sessionHooks.afterReplacementWritten = async () => {
+    replacementWritten();
+    await release;
+  };
+
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
-  handlers.get("session_compact")?.({ compactionEntry: { id: "keep-all" } }, live.ctx);
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  const compacting = handlers.get("session_compact")?.({ compactionEntry: { id: "keep-all" } }, live.ctx);
+  try {
+    await written;
+    expect(await leftoverReplacements(keepingPath)).toHaveLength(1);
+  } finally {
+    releaseReplacement();
+    await compacting;
+  }
 
   expect(live.reopened).toEqual([]);
   expect(live.notified).toEqual([]);
