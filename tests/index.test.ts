@@ -275,7 +275,7 @@ test("rewrites the session in place right after a compaction", async () => {
   expect(SessionManager.open(sourcePath).buildSessionContext()).toEqual(
     SessionManager.open(originalPath).buildSessionContext(),
   );
-  expect(live.notified.map((notice) => notice.level)).toEqual(["info"]);
+  await settle(() => expect(live.notified.map((notice) => notice.level)).toEqual(["info"]));
   expect(live.notified[0]?.message).toContain(String(before));
   expect(live.notified[0]?.message).toContain(String((await stat(sourcePath)).size));
 });
