@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.5 - 2026-11-01
+## 0.1.6 - 2026-11-01
 
 - Trim persisted sessions automatically after compaction while preserving the active session and its context. Automatic trimming is enabled by default and can be disabled with `autoAfterCompaction`.
 - Preserve retained entry IDs and concurrent session writes. Validate rewrites and recover missing-parent records only when the resulting context matches.
