@@ -264,8 +264,8 @@ test("rewrites the session in place right after a compaction", async () => {
   const live = createLiveContext(sourcePath);
 
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
-  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
-  await settle(() => expect(live.reopened).toEqual([sourcePath]));
+  await handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
+  expect(live.reopened).toEqual([sourcePath]);
 
   // Same file, same session, no switch, no leftover replacement.
   expect(live.switched).toEqual([]);
@@ -291,8 +291,8 @@ test("carries over entries appended while the trim was prepared", async () => {
   };
 
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
-  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
-  await settle(() => expect(live.reopened).toEqual([sourcePath]));
+  await handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
+  expect(live.reopened).toEqual([sourcePath]);
 
   const entries = (await readFile(sourcePath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   expect(entries.map((entry) => entry.id)).toContain(appendedId);
@@ -435,8 +435,7 @@ test("keeps automatic surgery off when Pi cannot reopen the live file", async ()
   handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, live.ctx);
   expect(live.notified.map((notice) => notice.level)).toEqual(["warning"]);
 
-  handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await handlers.get("session_compact")?.({ compactionEntry: { id: "c1" } }, live.ctx);
 
   expect(live.notified).toHaveLength(1);
   expect(live.reopened).toEqual([]);
