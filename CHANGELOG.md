@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.7 - 2026-11-04
 
 - Keep `custom` and `custom_message` entries when trimming after a compaction and in manual surgery. Dropping them made extensions that rebuild state from the branch, such as the ask queue, redeliver old answers. Only `ide-nested-results` is still dropped.
 
