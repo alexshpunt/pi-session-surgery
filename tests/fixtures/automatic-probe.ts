@@ -95,6 +95,8 @@ export default function probe(pi: ExtensionAPI): void {
   pi.on("agent_settled", (_event, ctx) => {
     if (remainingCompactions <= 0) return;
     remainingCompactions -= 1;
+    // Extension state written before a compaction must survive every later trim.
+    pi.appendEntry("probe-state", { round: remainingCompactions });
     record(ctx, "compact-request");
     ctx.compact({
       onComplete: () => {

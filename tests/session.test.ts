@@ -148,6 +148,44 @@ describe("session surgery", () => {
     );
   });
 
+  test("both rewrite modes keep extension records, except nested tool results", () => {
+    const entries = fixtureEntries();
+    const extra: SessionEntry[] = [
+      { type: "custom", id: "x1", parentId: "r1", timestamp: "2026-01-01T00:00:04.100Z", customType: "ask:queued", data: { requestId: "req-1" } },
+      { type: "custom_message", id: "x2", parentId: "x1", timestamp: "2026-01-01T00:00:04.200Z", customType: "ask:background-answer", content: "answer", display: false, details: { requestId: "req-1" } },
+      { type: "custom", id: "x3", parentId: "x2", timestamp: "2026-01-01T00:00:04.300Z", customType: "ide-nested-results", data: { parentToolCallId: "call-1" } },
+    ];
+    entries.splice(6, 0, ...extra);
+    entries.find((entry) => entry.id === "c1")!.parentId = "x3";
+    const parsed = parse(entries);
+
+    for (const build of [buildCompactionCheckpoint, buildSlimSession]) {
+      const rebuilt = parseSession(serializeSession(build(parsed)), "rebuilt.jsonl");
+      const kept = rebuilt.entries.filter((entry) => entry.type === "custom" || entry.type === "custom_message");
+      expect(kept.map((entry) => entry.customType)).toEqual(["ask:queued", "ask:background-answer"]);
+      expect(kept[1].details).toEqual({ requestId: "req-1" });
+      expect(rebuilt.entries.every((entry, index) => entry.parentId === (index === 0 ? null : rebuilt.entries[index - 1].id))).toBe(true);
+    }
+  });
+
+  test("kept extension records stay out of the context Pi sends to the model", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-session-surgery-records-"));
+    temporaryDirectories.push(directory);
+    const entries = fixtureEntries();
+    entries.splice(6, 0, { type: "custom_message", id: "x2", parentId: "r1", timestamp: "2026-01-01T00:00:04.200Z", customType: "ask:background-answer", content: "old answer", display: false });
+    entries.find((entry) => entry.id === "c1")!.parentId = "x2";
+    const parsed = parse(entries);
+    const originalPath = join(directory, "original.jsonl");
+    const checkpointPath = join(directory, "checkpoint.jsonl");
+    await writeFile(originalPath, parsed.raw);
+    await writeFile(checkpointPath, serializeSession(buildCompactionCheckpoint(parsed)));
+
+    expect(SessionManager.open(checkpointPath).buildSessionContext()).toEqual(
+      SessionManager.open(originalPath).buildSessionContext(),
+    );
+    expect(SessionManager.open(checkpointPath).getBranch().some((entry) => entry.type === "custom_message")).toBe(true);
+  });
+
   test("manual surgery cuts tool history and keeps the newest compaction", () => {
     const parsed = parse();
     const slim = buildSlimSession(parsed);

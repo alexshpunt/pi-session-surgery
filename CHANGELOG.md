@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Keep `custom` and `custom_message` entries when trimming after a compaction and in manual surgery. Dropping them made extensions that rebuild state from the branch, such as the ask queue, redeliver old answers. Only `ide-nested-results` is still dropped.
+
 ## 0.1.6 - 2026-11-01
 
 - Trim persisted sessions automatically after compaction while preserving the active session and its context. Automatic trimming is enabled by default and can be disabled with `autoAfterCompaction`.

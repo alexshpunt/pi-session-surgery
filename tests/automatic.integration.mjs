@@ -80,6 +80,12 @@ for (const scenario of ["normal", "orphan", "broken-checkpoint"]) {
     assert.equal(observations.filter((entry) => entry.event === "orphan-injected").length, Number(recoverOrphan));
     if (recoverOrphan) assert.equal(observations.find((entry) => entry.event === "orphan-injected").contextUnchanged, true);
 
+    if (!brokenCheckpoint) {
+      const finalEntries = (await readFile(join(cwd, "session-final.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      const states = finalEntries.filter((entry) => entry.type === "custom" && entry.customType === "probe-state");
+      assert.equal(states.length, rounds, "extension records written before every trim survived");
+    }
+
     const shutdown = observations.find((entry) => entry.event === "shutdown");
     assert.ok(before[0]?.file, "the probe saw a compaction in a persisted session");
     assert.ok(shutdown, "the run reported the session at shutdown");

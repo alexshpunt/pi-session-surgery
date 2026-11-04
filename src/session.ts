@@ -182,6 +182,8 @@ function retainedMessages(messages: Record<string, any>[]): Record<string, any>[
 }
 
 function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
+  if (isExtensionRecord(entry)) return structuredClone(entry);
+
   if (entry.type === "message") {
     const message = retainedMessage(entry.message);
     return message ? { ...structuredClone(entry), message } : undefined;
@@ -200,6 +202,23 @@ function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
   }
 
   return undefined;
+}
+
+/**
+ * Extension-owned records: `custom` state entries and `custom_message` entries.
+ *
+ * Extensions rebuild their state from the branch, such as which answers were already delivered or
+ * which guides were already read. Dropping these records makes them replay old work, so both
+ * rewrite modes keep them. The one exception is the rendering payload of nested tool results,
+ * which belongs to tool calls the rewrite has already removed and is the bulk of such records.
+ */
+const DROPPED_EXTENSION_RECORDS = new Set(["ide-nested-results"]);
+
+function isExtensionRecord(entry: SessionEntry): boolean {
+  return (
+    (entry.type === "custom" || entry.type === "custom_message") &&
+    !DROPPED_EXTENSION_RECORDS.has(entry.customType as string)
+  );
 }
 
 /** One entry kept for the replacement session, with its position on the original branch. */
@@ -314,7 +333,7 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
   }
 
   const controls = new Map<string, { index: number; entry: SessionEntry }>();
-  const systemControls: Array<{ index: number; entry: SessionEntry }> = [];
+  const preservedRecords: Array<{ index: number; entry: SessionEntry }> = [];
   for (const [index, entry] of branch.slice(0, firstKeptIndex).entries()) {
     if (entry.type === "model_change") {
       controls.set("model", { index, entry: structuredClone(entry) });
@@ -340,7 +359,11 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     } else if (entry.type === "session_info") {
       controls.set("session-info", { index, entry: structuredClone(entry) });
     } else if (entry.type === "message" && entry.message?.role === "system") {
-      systemControls.push({ index, entry });
+      preservedRecords.push({ index, entry });
+    } else if (isExtensionRecord(entry) && !(index === 0 && entry.parentId !== null)) {
+      // Invisible to the model, but extensions read their state back from the branch. A root that
+      // points to a missing parent is damaged history: it stays hidden and is dropped, never relinked.
+      preservedRecords.push({ index, entry });
     }
   }
 
@@ -350,7 +373,7 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     .filter(({ entry }) => entry.type !== "compaction" || entry.id === compaction.id);
 
   const ordered = [
-    ...[...controls.values(), ...systemControls].sort((left, right) => left.index - right.index),
+    ...[...controls.values(), ...preservedRecords].sort((left, right) => left.index - right.index),
     ...visible,
   ];
 

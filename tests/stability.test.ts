@@ -48,7 +48,7 @@ async function setup(options: { orphan?: boolean; visibleEdit?: boolean } = {}) 
   const path = join(directory, "session.jsonl");
   const entries = [
     { type: "session", version: 3, id: "stability", cwd: directory, timestamp: "2026-01-01T00:00:00.000Z" },
-    { type: "custom_message", id: "old", parentId: options.orphan ? "missing" : null, customType: "old", content: "Discarded history. ".repeat(1000), display: true, timestamp: "2026-01-01T00:00:01.000Z" },
+    { type: "message", id: "old", parentId: options.orphan ? "missing" : null, message: { role: "user", content: "Discarded history. ".repeat(1000), timestamp: 1 }, timestamp: "2026-01-01T00:00:01.000Z" },
     { type: "message", id: "kept", parentId: "old", message: { role: "user", content: "Keep this question", timestamp: 2 }, timestamp: "2026-01-01T00:00:02.000Z" },
     { type: "compaction", id: "checkpoint", parentId: "kept", summary: "Preserved summary", firstKeptEntryId: "kept", tokensBefore: 10000, timestamp: "2026-01-01T00:00:03.000Z", systemMessage: { role: "system", content: "Preserved prompt", toolsAdded: [], timestamp: 3 } },
     ...(options.visibleEdit ? [{ type: "context_edit", id: "edit", parentId: "checkpoint", targetId: "kept", replacement: "Edited question", timestamp: "2026-01-01T00:00:04.000Z" }] : []),

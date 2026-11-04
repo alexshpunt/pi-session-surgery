@@ -5,8 +5,15 @@ A Pi extension that keeps long-running sessions small on disk.
 Pi rebuilds the context it sends to the model from the newest compaction: the summary plus every
 entry from that compaction's first kept entry onwards. Everything before that boundary is never
 sent to the model. The moment Pi reports a successful compaction, the extension rewrites the session
-file in place and drops exactly that invisible part, plus the older compaction records. The part the
+file in place and drops the invisible messages, plus the older compaction records. The part the
 model can see is copied unchanged, so what the model receives does not change.
+
+Extension records are the exception: `custom` and `custom_message` entries before the boundary stay
+in the file. Extensions read their state back from the session branch, for example which answers
+were already delivered or which guides were already read, so dropping them makes an extension
+replay old work after a compaction. They are not part of the model context either way. The only
+dropped extension records are `ide-nested-results`, the rendering payload of tool calls the rewrite
+removes.
 
 The rewrite happens on Pi's own session file, so there is no session switch: the session keeps its
 ID, its file name, its transcript and the running turn.
@@ -85,8 +92,9 @@ history needs investigation before retrying.
 ## Manual surgery behavior
 
 The manual replacement keeps user messages, assistant text and thinking, model and thinking-level
-changes, session info, and the newest compaction record. It removes tool calls, tool results, bash
-execution records, and other extension entries.
+changes, session info, extension records (`custom` and `custom_message`, except
+`ide-nested-results`), and the newest compaction record. It removes tool calls, tool results, and
+bash execution records.
 
 Retained assistant content is rebuilt as plain transcript content: provider replay IDs and
 signatures are discarded, and each retained assistant message gets a normal completed stop reason.
