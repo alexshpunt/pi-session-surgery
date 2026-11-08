@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import { buildSessionContext, type ExtensionAPI, type ExtensionContext, type SessionManager } from "@earendil-works/pi-coding-agent";
 
-import register from "../../src/index.js";
+import register from "../../src/index.ts";
 
 /** Drive the real Pi and observe both sides of the awaited compaction handler. */
 export default function probe(pi: ExtensionAPI): void {

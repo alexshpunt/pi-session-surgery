@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, expect, test } from "vitest";
 
-import { loadSessionSurgeryConfig } from "../src/config.js";
+import { loadSessionSurgeryConfig } from "../src/config.ts";
 
 const temporaryDirectories: string[] = [];
 

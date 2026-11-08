@@ -7,7 +7,7 @@ import {
   parseSession,
   serializeSession,
   type SessionEntry,
-} from "../src/session.js";
+} from "../src/session.ts";
 
 const tool = (name: string, description = name) => ({ name, description, parameters: { type: "object", properties: {} } });
 const system = (toolsAdded: ReturnType<typeof tool>[], toolsRemoved: string[] = []) => ({

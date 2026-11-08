@@ -11,7 +11,7 @@ import {
   replacementSessionPath,
   serializeSession,
   type SessionEntry,
-} from "../src/session.js";
+} from "../src/session.ts";
 
 const temporaryDirectories: string[] = [];
 

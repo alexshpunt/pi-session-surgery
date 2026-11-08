@@ -3,9 +3,9 @@ import { stat, unlink } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 
-import { loadSessionSurgeryConfig } from "./config.js";
+import { loadSessionSurgeryConfig } from "./config.ts";
 
-import type { ParsedSession } from "./session.js";
+import type { ParsedSession } from "./session.ts";
 import {
   activeBranch,
   buildCompactionCheckpoint,
@@ -18,7 +18,7 @@ import {
   SessionChangedError,
   SessionValidationError,
   writeReplacementSession,
-} from "./session.js";
+} from "./session.ts";
 
 const COMMAND = "session-surgery";
 
