@@ -4,13 +4,13 @@ import { join } from "node:path";
 
 import { afterEach, expect, test, vi } from "vitest";
 
-import register from "../src/index.js";
+import register from "../src/index.ts";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { SlimSession } from "../src/session.js";
-import { parseSession } from "../src/session.js";
+import type { SlimSession } from "../src/session.ts";
+import { parseSession } from "../src/session.ts";
 
 /** Pause real filesystem operations at the race boundaries under test. */
 const sessionHooks = vi.hoisted(() => ({
@@ -20,7 +20,7 @@ const sessionHooks = vi.hoisted(() => ({
 }));
 
 vi.mock("../src/session.js", async (importOriginal) => {
-  const original = await importOriginal<typeof import("../src/session.js")>();
+  const original = await importOriginal<typeof import("../src/session.ts")>();
   return {
     ...original,
     writeReplacementSession: async (path: string, session: SlimSession) => {

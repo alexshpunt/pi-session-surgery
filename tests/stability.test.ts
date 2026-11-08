@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test, vi } from "vitest";
 
-import register from "../src/index.js";
-import { parseSession, type SlimSession } from "../src/session.js";
+import register from "../src/index.ts";
+import { parseSession, type SlimSession } from "../src/session.ts";
 
 const hooks = vi.hoisted(() => ({
   prepared: undefined as ((path: string) => Promise<void>) | undefined,
@@ -24,7 +24,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 vi.mock("../src/session.js", async (importOriginal) => {
-  const original = await importOriginal<typeof import("../src/session.js")>();
+  const original = await importOriginal<typeof import("../src/session.ts")>();
   return {
     ...original,
     writeReplacementSession: async (path: string, session: SlimSession) => {
