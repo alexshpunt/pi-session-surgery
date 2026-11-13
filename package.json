@@ -29,7 +29,7 @@
   },
   "scripts": {
     "test": "vitest run",
-    "test:integration": "node --test tests/automatic.integration.mjs",
+    "test:integration": "node --test tests/*.integration.mjs",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
     "prepack": "npm run check",

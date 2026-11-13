@@ -254,6 +254,54 @@ test("registers the manual surgery command", () => {
   expect(createPi().commandsInOrder).toEqual(["session-surgery"]);
 });
 
+test("detects each new checkpoint once without trimming history loaded at startup", async () => {
+  const { handlers } = createPi();
+  const sourcePath = await sessionFile();
+  const live = createLiveContext(sourcePath);
+  const manager = live.ctx.sessionManager;
+  manager.appendModelChange("fixture", "fixture-model");
+  let prepared = 0;
+  sessionHooks.afterReplacementWritten = async () => { prepared += 1; };
+
+  handlers.get("session_start")?.({ reason: "startup" }, live.ctx);
+  await handlers.get("turn_start")?.({}, live.ctx);
+  await handlers.get("agent_settled")?.({}, live.ctx);
+  expect(prepared).toBe(0);
+
+  manager.appendMessage({ role: "user", content: "Discarded payload. ".repeat(500), timestamp: 3 });
+  const boundary = manager.appendMessage({ role: "user", content: "Retained question", timestamp: 4 });
+  const id = manager.appendCompaction("New checkpoint", boundary, 10000);
+  await handlers.get("turn_start")?.({}, live.ctx);
+  await settle(() => expect(live.notified).toHaveLength(1));
+  expect(live.reopened, JSON.stringify(live.notified)).toEqual([sourcePath]);
+  expect(prepared).toBe(1);
+
+  await handlers.get("session_compact")?.({ compactionEntry: { id } }, live.ctx);
+  await handlers.get("agent_settled")?.({}, live.ctx);
+  await handlers.get("turn_start")?.({}, live.ctx);
+  expect(prepared).toBe(1);
+  expect(await leftoverReplacements(sourcePath)).toEqual([]);
+});
+
+test("does not mistake navigation to an existing checkpoint for a new compaction", async () => {
+  const { handlers } = createPi();
+  const sourcePath = await sessionFile();
+  const live = createLiveContext(sourcePath);
+  const manager = live.ctx.sessionManager;
+  manager.appendModelChange("fixture", "fixture-model");
+  manager.appendCompaction("Other branch checkpoint", "u2", 10000);
+  handlers.get("session_start")?.({ reason: "resume" }, live.ctx);
+
+  manager.branch("u2");
+  manager.appendMessage({ role: "user", content: "Continue the earlier branch", timestamp: 5 });
+  const before = await readFile(sourcePath, "utf8");
+  await handlers.get("turn_start")?.({}, live.ctx);
+  await handlers.get("agent_settled")?.({}, live.ctx);
+
+  expect(live.reopened).toEqual([]);
+  expect(await readFile(sourcePath, "utf8")).toBe(before);
+});
+
 test("rewrites the session in place right after a compaction", async () => {
   const { handlers } = createPi();
   const sourcePath = await sessionFile();
