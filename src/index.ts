@@ -48,6 +48,15 @@ function supportsInPlaceTrim(ctx: ExtensionContext): boolean {
   return typeof liveSessionManager(ctx).setSessionFile === "function";
 }
 
+/** Only persisted entries on the active branch can trigger automatic surgery. */
+function latestCompactionId(ctx: ExtensionContext): string | undefined {
+  const branch = ctx.sessionManager.getBranch();
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    if (branch[index].type === "compaction") return branch[index].id;
+  }
+  return undefined;
+}
+
 function isStaleContextError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith(STALE_CONTEXT_PREFIX);
 }
@@ -256,6 +265,8 @@ async function trimAfterCompaction(
 export default function register(pi: ExtensionAPI): void {
   let autoAfterCompaction = true;
   let generation = 0;
+  const observedCompactions = new Set<string>();
+  let requestedCompaction: { id: string; file: string | undefined; sessionId: string } | undefined;
   let pending: { id: string; ctx: ExtensionContext; generation: number } | undefined;
   let trimming: Promise<void> | undefined;
   const notices: Array<() => void> = [];
@@ -263,6 +274,8 @@ export default function register(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     generation += 1;
     pending = undefined;
+    observedCompactions.clear();
+    requestedCompaction = undefined;
     try {
       autoAfterCompaction = loadSessionSurgeryConfig(ctx.cwd, getAgentDir(), ctx.isProjectTrusted()).autoAfterCompaction;
     } catch (error) {
@@ -275,6 +288,12 @@ export default function register(pi: ExtensionAPI): void {
         "Automatic session surgery is off: this Pi cannot point the live session at a rewritten file.",
         "warning",
       );
+    }
+    // Navigation to any existing branch must not look like a new compaction.
+    if (autoAfterCompaction) {
+      for (const entry of ctx.sessionManager.getEntries()) {
+        if (entry.type === "compaction") observedCompactions.add(entry.id);
+      }
     }
   });
 
@@ -311,15 +330,35 @@ export default function register(pi: ExtensionAPI): void {
     }
   };
 
-  pi.on("session_compact", async (event, ctx) => {
+  const requestTrim = async (id: string, ctx: ExtensionContext): Promise<void> => {
     if (!autoAfterCompaction) return;
-    pending = { id: event.compactionEntry.id, ctx, generation };
-    // Pi awaits this event before onComplete messages and the next turn can append.
-    if (!trimming) trimming = runPendingTrim();
+    observedCompactions.add(id);
+    const file = ctx.sessionManager.getSessionFile();
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (id !== requestedCompaction?.id || file !== requestedCompaction.file || sessionId !== requestedCompaction.sessionId) {
+      requestedCompaction = { id, file, sessionId };
+      pending = { id, ctx, generation };
+      if (!trimming) trimming = runPendingTrim();
+    }
     await trimming;
     const ready = notices.splice(0);
     if (ready.length) setTimeout(() => { for (const notify of ready) notify(); }, 0);
+  };
+
+  pi.on("session_compact", async (event, ctx) => {
+    await requestTrim(event.compactionEntry.id, ctx);
   });
+
+  const detectCompaction = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
+    if (!autoAfterCompaction) return;
+    const id = latestCompactionId(ctx);
+    if (id && !observedCompactions.has(id)) await requestTrim(id, ctx);
+  };
+
+  // Boundary handlers return drafts. Pi persists them only after all handlers finish, so inspect
+  // the branch at awaited post-boundary events, before a continuation or after the run settles.
+  pi.on("turn_start", detectCompaction);
+  pi.on("agent_settled", detectCompaction);
 
   pi.on("session_shutdown", () => {
     generation += 1;
