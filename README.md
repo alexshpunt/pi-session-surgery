@@ -4,9 +4,9 @@ A Pi extension that keeps long-running sessions small on disk.
 
 Pi rebuilds the context it sends to the model from the newest compaction: the summary plus every
 entry from that compaction's first kept entry onwards. Everything before that boundary is never
-sent to the model. The moment Pi reports a successful compaction, the extension rewrites the session
-file in place and drops the invisible messages, plus the older compaction records. The part the
-model can see is copied unchanged, so what the model receives does not change.
+sent to the model. After Pi saves a new compaction, the extension rewrites the session file in place
+and drops the invisible messages, plus the older compaction records. The part the model can see is
+copied unchanged, so what the model receives does not change.
 
 Extension records are the exception: `custom` and `custom_message` entries before the boundary stay
 in the file. Extensions read their state back from the session branch, for example which answers
@@ -23,8 +23,8 @@ a plain transcript without tool history.
 
 ## Safety model
 
-- Automatic surgery runs after Pi saves a successful compaction. Pi waits for the trim before
-  continuation messages or the next turn can append.
+- Automatic surgery runs after Pi saves a new compaction. Pi awaits the trim at the compaction
+  event, the next turn start, or agent settlement.
 - The session keeps its file and ID. No turn is aborted, replayed or resumed.
 - Before replacement, Pi must build identical context from the original and rewritten files,
   including the system checkpoint, tool declarations and retained tool exchanges.
@@ -60,8 +60,14 @@ model is using right now.
 
 ### When it runs
 
-Pi waits for the compaction event handler to finish trimming before the turn continues. File
-preparation is asynchronous; the final validation, replacement and manager reload are synchronous.
+Pi awaits trimming in `session_compact` for its built-in compaction paths. Compactions returned by
+extension boundary handlers may have no `session_compact` event. Surgery detects those saved
+checkpoints at `turn_start`, before the next response, or at `agent_settled` when there is no
+continuation. It does not depend on the extension that created the compaction.
+
+Each checkpoint is handled once per loaded session. Loading an existing session alone does not
+trigger a trim. File preparation is asynchronous; the final validation, replacement and manager
+reload are synchronous.
 
 1. Read a complete-line snapshot and prepare the replacement beside the source.
 2. Check that the session, live leaf and source prefix still match; carry over any appended entries.
