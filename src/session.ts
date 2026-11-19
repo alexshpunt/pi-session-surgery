@@ -182,7 +182,8 @@ function retainedMessages(messages: Record<string, any>[]): Record<string, any>[
 }
 
 function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
-  if (isExtensionRecord(entry)) return structuredClone(entry);
+  // Manual surgery removes every tool call, so no tool start time stays relevant.
+  if (isExtensionRecord(entry)) return retainedExtensionRecord(entry, new Set());
 
   if (entry.type === "message") {
     const message = retainedMessage(entry.message);
@@ -209,16 +210,70 @@ function retainedEntry(entry: SessionEntry): SessionEntry | undefined {
  *
  * Extensions rebuild their state from the branch, such as which answers were already delivered or
  * which guides were already read. Dropping these records makes them replay old work, so both
- * rewrite modes keep them. The one exception is the rendering payload of nested tool results,
- * which belongs to tool calls the rewrite has already removed and is the bulk of such records.
+ * rewrite modes keep them, except the display-only records listed below.
  */
-const DROPPED_EXTENSION_RECORDS = new Set(["ide-nested-results"]);
-
 function isExtensionRecord(entry: SessionEntry): boolean {
-  return (
-    (entry.type === "custom" || entry.type === "custom_message") &&
-    !DROPPED_EXTENSION_RECORDS.has(entry.customType as string)
-  );
+  return entry.type === "custom" || entry.type === "custom_message";
+}
+
+/**
+ * Records that only render the transcript and that no extension reads back from the branch.
+ *
+ * - `ide-nested-results`: rendering payload of nested tool results (pi-agent-ide).
+ * - `terminal-completion-display`, `terminal-stale-display`: terminal cards with a full copy of the
+ *   terminal output (pi-agent-ide terminal).
+ * - `agent-foreman-decision`: the foreman decision card with a copy of the turn activity.
+ */
+const DISPLAY_ONLY_RECORDS = new Set([
+  "ide-nested-results",
+  "terminal-completion-display",
+  "terminal-stale-display",
+  "agent-foreman-decision",
+]);
+
+/** Tool start times (pi-stereo-view), read back by tool call ID. */
+const TOOL_START_RECORD = "pi-agent-transcript/tool-start";
+
+/**
+ * Terminal notices whose details carry a full copy of the terminal output. The model receives only
+ * the message content; extensions read the session source and status from the details.
+ */
+const TERMINAL_NOTICES = new Set(["terminal-completion", "terminal-stale"]);
+
+/**
+ * Return the copy of an extension record to keep, or `undefined` to drop it.
+ *
+ * Display-only records are dropped. A tool start time is kept only while its tool call is kept.
+ * Terminal notices keep their content and details without the copied terminal output.
+ */
+function retainedExtensionRecord(entry: SessionEntry, keptToolCallIds: ReadonlySet<string>): SessionEntry | undefined {
+  const customType = entry.customType as string;
+  if (DISPLAY_ONLY_RECORDS.has(customType)) return undefined;
+  if (customType === TOOL_START_RECORD) {
+    return keptToolCallIds.has(entry.data?.toolCallId) ? structuredClone(entry) : undefined;
+  }
+
+  const record = structuredClone(entry);
+  if (entry.type === "custom_message" && TERMINAL_NOTICES.has(customType) && record.details) {
+    const snapshots = Array.isArray(record.details.sessions) ? record.details.sessions : [record.details];
+    for (const snapshot of snapshots) {
+      // An empty string keeps the snapshot shape that the terminal renderer validates.
+      if (typeof snapshot?.output === "string") snapshot.output = "";
+    }
+  }
+  return record;
+}
+
+/** IDs of the tool calls in the given entries. */
+function toolCallIds(entries: SessionEntry[]): Set<string> {
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.message?.role !== "assistant" || !Array.isArray(entry.message.content)) continue;
+    for (const block of entry.message.content) {
+      if (block?.type === "toolCall" && typeof block.id === "string") ids.add(block.id);
+    }
+  }
+  return ids;
 }
 
 /** One entry kept for the replacement session, with its position on the original branch. */
@@ -332,6 +387,12 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     fail(`compaction ${compaction.id} first kept entry ${String(compaction.firstKeptEntryId)} was not found`, "the compaction boundary is missing");
   }
 
+  const visible: Array<{ entry: SessionEntry; index: number }> = branch
+    .slice(firstKeptIndex)
+    .map((entry, offset) => ({ entry, index: firstKeptIndex + offset }))
+    .filter(({ entry }) => entry.type !== "compaction" || entry.id === compaction.id);
+  const keptToolCallIds = toolCallIds(visible.map(({ entry }) => entry));
+
   const controls = new Map<string, { index: number; entry: SessionEntry }>();
   const preservedRecords: Array<{ index: number; entry: SessionEntry }> = [];
   for (const [index, entry] of branch.slice(0, firstKeptIndex).entries()) {
@@ -363,14 +424,10 @@ export function buildCompactionCheckpoint(session: ParsedSession): SlimSession {
     } else if (isExtensionRecord(entry) && !(index === 0 && entry.parentId !== null)) {
       // Invisible to the model, but extensions read their state back from the branch. A root that
       // points to a missing parent is damaged history: it stays hidden and is dropped, never relinked.
-      preservedRecords.push({ index, entry });
+      const record = retainedExtensionRecord(entry, keptToolCallIds);
+      if (record) preservedRecords.push({ index, entry: record });
     }
   }
-
-  const visible: Array<{ entry: SessionEntry; index: number }> = branch
-    .slice(firstKeptIndex)
-    .map((entry, offset) => ({ entry, index: firstKeptIndex + offset }))
-    .filter(({ entry }) => entry.type !== "compaction" || entry.id === compaction.id);
 
   const ordered = [
     ...[...controls.values(), ...preservedRecords].sort((left, right) => left.index - right.index),
