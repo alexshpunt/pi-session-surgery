@@ -11,9 +11,19 @@ copied unchanged, so what the model receives does not change.
 Extension records are the exception: `custom` and `custom_message` entries before the boundary stay
 in the file. Extensions read their state back from the session branch, for example which answers
 were already delivered or which guides were already read, so dropping them makes an extension
-replay old work after a compaction. They are not part of the model context either way. The only
-dropped extension records are `ide-nested-results`, the rendering payload of tool calls the rewrite
-removes.
+replay old work after a compaction. They are not part of the model context either way.
+
+Records that only draw the transcript and that no extension reads back are dropped:
+
+- `ide-nested-results`: the rendering payload of nested tool results;
+- `terminal-completion-display` and `terminal-stale-display`: terminal cards, each with a full copy
+  of the terminal output;
+- `agent-foreman-decision`: the foreman decision card;
+- `pi-agent-transcript/tool-start`: tool start times, unless their tool call is still kept.
+
+The `terminal-completion` and `terminal-stale` notices stay, but without the copied terminal output
+in their details. Their message content and session identity are unchanged. On a real session these
+records made up 4.6 MB of a 5.2 MB file after the boundary had been trimmed.
 
 The rewrite happens on Pi's own session file, so there is no session switch: the session keeps its
 ID, its file name, its transcript and the running turn.
@@ -98,9 +108,9 @@ history needs investigation before retrying.
 ## Manual surgery behavior
 
 The manual replacement keeps user messages, assistant text and thinking, model and thinking-level
-changes, session info, extension records (`custom` and `custom_message`, except
-`ide-nested-results`), and the newest compaction record. It removes tool calls, tool results, and
-bash execution records.
+changes, session info, extension records (`custom` and `custom_message`, with the same display-only
+exceptions as automatic surgery), and the newest compaction record. It removes tool calls, tool
+results, and bash execution records.
 
 Retained assistant content is rebuilt as plain transcript content: provider replay IDs and
 signatures are discarded, and each retained assistant message gets a normal completed stop reason.
