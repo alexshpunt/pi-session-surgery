@@ -26,7 +26,9 @@ for (const boundary of ["turn_end", "agent_before_settle"]) {
         const result = await new PiIntegrationTest({
           testName: `boundary-${boundary}-${retainNone ? "none" : "tail"}-${continueRun ? "continue" : "settle"}`,
           cwd, artifactsDir: artifacts, extensions: [fixture], tools: ["read", "write"],
-          rawMode: false, isolateUserResources: false,
+          // The PTY runner stops Pi when the harness traces agent_settled, before later
+          // agent_settled handlers such as the trim finish. RPC waits for Pi's own settlement.
+          transport: "rpc", isolateUserResources: false,
           piCommand: process.env.PI_SURGERY_TEST_PI ?? "pi",
           environment: {
             PI_CODING_AGENT_DIR: join(cwd, "agent"),
@@ -80,7 +82,8 @@ for (const boundary of ["turn_end", "agent_before_settle"]) {
         for (const id of [...Array.from({ length: rounds }, (_, round) => `history-${round}`), "result"]) {
           assert.equal(getToolExecution(result, id).isError, false, `${id} executed successfully`);
         }
-        assert.equal(result.exitCode, 0);
+        // The RPC runner stops the settled Pi process with SIGTERM.
+        assert.ok([0, 143].includes(result.exitCode), `unexpected exit code ${result.exitCode}`);
       });
     }
   }

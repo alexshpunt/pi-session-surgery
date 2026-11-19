@@ -148,24 +148,49 @@ describe("session surgery", () => {
     );
   });
 
-  test("both rewrite modes keep extension records, except nested tool results", () => {
+  test("both rewrite modes keep extension records, except display-only records", () => {
     const entries = fixtureEntries();
+    const output = "x".repeat(10_000);
+    const snapshot = { id: "t1", source: "shell:t1", origin: { sessionId: "s" }, status: "completed", output };
     const extra: SessionEntry[] = [
       { type: "custom", id: "x1", parentId: "r1", timestamp: "2026-01-01T00:00:04.100Z", customType: "ask:queued", data: { requestId: "req-1" } },
       { type: "custom_message", id: "x2", parentId: "x1", timestamp: "2026-01-01T00:00:04.200Z", customType: "ask:background-answer", content: "answer", display: false, details: { requestId: "req-1" } },
       { type: "custom", id: "x3", parentId: "x2", timestamp: "2026-01-01T00:00:04.300Z", customType: "ide-nested-results", data: { parentToolCallId: "call-1" } },
+      { type: "custom_message", id: "x4", parentId: "x3", timestamp: "2026-01-01T00:00:04.400Z", customType: "terminal-completion", content: "Background terminal completed", display: false, details: { sessions: [snapshot] } },
+      { type: "custom", id: "x5", parentId: "x4", timestamp: "2026-01-01T00:00:04.500Z", customType: "terminal-completion-display", data: { sessions: [snapshot] } },
+      { type: "custom_message", id: "x6", parentId: "x5", timestamp: "2026-01-01T00:00:04.600Z", customType: "terminal-stale", content: "Background terminal is stale", display: false, details: snapshot },
+      { type: "custom", id: "x7", parentId: "x6", timestamp: "2026-01-01T00:00:04.700Z", customType: "terminal-stale-display", data: snapshot },
+      { type: "custom", id: "x8", parentId: "x7", timestamp: "2026-01-01T00:00:04.800Z", customType: "agent-foreman-decision", data: { activity: output } },
+      { type: "custom", id: "x9", parentId: "x8", timestamp: "2026-01-01T00:00:04.900Z", customType: "pi-agent-transcript/tool-start", data: { toolCallId: "call-1", time: 1 } },
+      { type: "custom", id: "x10", parentId: "x9", timestamp: "2026-01-01T00:00:04.950Z", customType: "pi-agent-transcript/tool-start", data: { toolCallId: "call-2", time: 2 } },
     ];
     entries.splice(6, 0, ...extra);
-    entries.find((entry) => entry.id === "c1")!.parentId = "x3";
+    entries.find((entry) => entry.id === "c1")!.parentId = "x10";
     const parsed = parse(entries);
 
     for (const build of [buildCompactionCheckpoint, buildSlimSession]) {
       const rebuilt = parseSession(serializeSession(build(parsed)), "rebuilt.jsonl");
       const kept = rebuilt.entries.filter((entry) => entry.type === "custom" || entry.type === "custom_message");
-      expect(kept.map((entry) => entry.customType)).toEqual(["ask:queued", "ask:background-answer"]);
+      // The automatic checkpoint keeps call-2 in the visible context, so its start time stays.
+      const toolStarts = build === buildCompactionCheckpoint ? ["pi-agent-transcript/tool-start"] : [];
+      expect(kept.map((entry) => entry.customType)).toEqual([
+        "ask:queued",
+        "ask:background-answer",
+        "terminal-completion",
+        "terminal-stale",
+        ...toolStarts,
+      ]);
       expect(kept[1].details).toEqual({ requestId: "req-1" });
+      // Terminal notices keep their content and session identity without the copied output.
+      expect(kept[2].content).toBe("Background terminal completed");
+      expect(kept[2].details).toEqual({ sessions: [{ ...snapshot, output: "" }] });
+      expect(kept[3].details).toEqual({ ...snapshot, output: "" });
+      if (toolStarts.length) expect(kept[4].data).toEqual({ toolCallId: "call-2", time: 2 });
+      expect(JSON.stringify(rebuilt.entries)).not.toContain(output);
       expect(rebuilt.entries.every((entry, index) => entry.parentId === (index === 0 ? null : rebuilt.entries[index - 1].id))).toBe(true);
     }
+    // The source entries are not modified by the rewrite.
+    expect(parsed.entries.find((entry) => entry.id === "x4")?.details.sessions[0].output).toBe(output);
   });
 
   test("kept extension records stay out of the context Pi sends to the model", async () => {
