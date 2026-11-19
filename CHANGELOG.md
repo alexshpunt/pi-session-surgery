@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Drop display-only extension records when trimming: terminal cards, foreman decision cards and tool start times of removed tool calls. Terminal notices keep their content and session identity but no longer carry a copy of the terminal output. These records kept trimmed sessions at several megabytes.
+- Run the boundary integration tests through RPC. The PTY runner stopped Pi before the trim in a later `agent_settled` handler finished, so the settlement cases failed.
+
 ## 0.1.8 - 2026-11-09
 
 - Pi loads the extension faster.
